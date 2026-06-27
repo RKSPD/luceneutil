@@ -16,13 +16,36 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from urllib import request
 
 PYTHON_MAJOR_VER = sys.version_info.major
+
+# --- Large-scale SOTA vector source: Cohere v3 multilingual Wikipedia embeddings -------------------
+# CohereLabs/wikipedia-2023-11-embed-multilingual-v3 (the SOTA superset the bundled
+# cohere-v3-wikipedia-en-scattered-1M sample is drawn from): ~250M passages x 1024d, unit-norm, the
+# same embedding model/distribution as the existing data so a frozen PCA/ITQ basis stays comparable.
+# It ships as hundreds of per-language parquet shards (HF's auto-converted parquet), NOT a .vec, so
+# build_large_vecs() streams them shard-by-shard into a raw little-endian float32 .vec (the format
+# knnPerfTest/KnnGraphTester read). Reachability notes for this (restricted) network, all verified:
+#   - HF + the parquet API + the r2.dev buckets are reachable via `curl` (system CA store), but Python's
+#     urllib fails TLS (no CA certs in the venv) -- so downloads shell out to curl, not urllib.
+#   - parquet is read with pyarrow (prebuilt wheel: `pip install --only-binary=:all: pyarrow`).
+# The HF auto-parquet shard list per language config:
+#   https://huggingface.co/api/datasets/<repo>/parquet/<lang>/train  -> JSON array of shard URLs
+LARGE_VEC_HF_REPO = "CohereLabs/wikipedia-2023-11-embed-multilingual-v3"
+LARGE_VEC_DIM = 1024
+LARGE_VEC_EMB_COLUMN = "emb"
+# Language configs to consume IN ORDER until the target doc count is reached. en (~41M) leads (matches
+# the bundled English sample); the rest are large Wikipedias appended only if a bigger target needs them.
+LARGE_VEC_LANG_ORDER = ("en", "de", "fr", "ru", "es", "it", "ja", "zh", "pt", "nl")
+# Bytes per vector on disk (raw float32, no header) -- used for size/target math.
+_LARGE_VEC_BYTES_PER_VEC = LARGE_VEC_DIM * 4
 
 BASE_URL = "https://home.apache.org/~mikemccand"
 BASE_URL2 = "https://home.apache.org/~sokolov"
@@ -49,6 +72,129 @@ DEFAULT_LOCAL_CONST = """
 BASE_DIR = '%(base_dir)s'
 BENCH_BASE_DIR = '%(base_dir)s/%(cwd)s'
 """
+
+
+def _curl_to_file(url, target_path, retries=3):
+  """Download url -> target_path via curl (system CA store; venv urllib lacks CA certs on this network).
+
+  Uses curl's own resume (-C -) and fail-on-error (-f). Returns on success, raises after `retries`.
+  """
+  for attempt in range(1, retries + 1):
+    # -f: fail (non-zero) on HTTP >=400 instead of writing an error body; -L: follow redirects;
+    # -C -: resume a partial file; --retry: curl-level transient-error retries.
+    rc = subprocess.call(
+      ["curl", "-fL", "-C", "-", "--retry", "5", "--retry-delay", "3", "-o", target_path, url]
+    )
+    if rc == 0:
+      return
+    print(f"  curl failed (rc={rc}) for {url} (attempt {attempt}/{retries})")
+    time.sleep(2 * attempt)
+  raise RuntimeError(f"curl failed {retries}x for {url}")
+
+
+def _curl_to_string(url):
+  """GET url and return the response body as text (follows redirects), via curl."""
+  out = subprocess.run(["curl", "-fsSL", url], capture_output=True, text=True, check=True)
+  return out.stdout
+
+
+def _list_shard_urls(repo, lang):
+  """Return the ordered list of HF auto-parquet shard URLs for one language config of `repo`."""
+  api = f"https://huggingface.co/api/datasets/{repo}/parquet/{lang}/train"
+  return json.loads(_curl_to_string(api))
+
+
+def build_large_vecs(data_dir, target_docs, langs=LARGE_VEC_LANG_ORDER, repo=LARGE_VEC_HF_REPO):
+  """Stream Cohere-v3 multilingual parquet shards into a single raw float32 .vec of up to target_docs.
+
+  Memory- and disk-frugal and RESUMABLE:
+    - one shard on disk at a time (download -> extract -> delete the parquet),
+    - parquet read in row-group batches (constant RAM regardless of shard size),
+    - appends raw little-endian float32 (dim*4 bytes/vec, no header) -- the .vec format the harness reads,
+    - a sidecar .progress json records (#docs written, last completed (lang, shard-index)) so a re-run
+      continues instead of restarting; the .vec is truncated back to the recorded length first so a
+      shard interrupted mid-write can't leave a partial vector.
+
+  Returns the output .vec path. Companion query file is the bundled 200K queries (same distribution).
+  """
+  import numpy as np
+  import pyarrow.parquet as pq
+
+  out_path = os.path.join(data_dir, f"cohere-v3-multilingual-1024d.docs.{target_docs}.vec")
+  progress_path = out_path + ".progress"
+
+  # Resume: read how many docs we already wrote and which shards are done, then truncate the .vec to
+  # exactly that many docs (drops any partial trailing vector from an interrupted run).
+  done_shards = set()
+  docs_written = 0
+  if os.path.exists(progress_path):
+    with open(progress_path) as f:
+      state = json.load(f)
+    docs_written = state.get("docs_written", 0)
+    done_shards = {tuple(s) for s in state.get("done_shards", [])}
+    clean_len = docs_written * _LARGE_VEC_BYTES_PER_VEC
+    if os.path.exists(out_path) and os.path.getsize(out_path) != clean_len:
+      with open(out_path, "r+b") as f:
+        f.truncate(clean_len)
+    print(f"resuming: {docs_written:,} docs already written, {len(done_shards)} shards done")
+
+  if docs_written >= target_docs:
+    print(f"already have {docs_written:,} >= target {target_docs:,} docs at {out_path}")
+    return out_path
+
+  tmp_parquet = os.path.join(data_dir, ".large_vec_shard.parquet.tmp")
+  t0 = time.time()
+  out_f = open(out_path, "ab")
+  try:
+    for lang in langs:
+      if docs_written >= target_docs:
+        break
+      print(f"=== language config '{lang}' ===")
+      try:
+        shard_urls = _list_shard_urls(repo, lang)
+      except Exception as e:
+        print(f"  could not list shards for '{lang}': {e} -- skipping")
+        continue
+      print(f"  {len(shard_urls)} shards")
+      for shard_idx, url in enumerate(shard_urls):
+        if docs_written >= target_docs:
+          break
+        if (lang, shard_idx) in done_shards:
+          continue
+        # Remove any leftover temp from the previous shard FIRST: _curl_to_file resumes with `-C -`,
+        # which would otherwise append this shard's bytes onto the prior shard's file and corrupt it.
+        if os.path.exists(tmp_parquet):
+          os.remove(tmp_parquet)
+        _curl_to_file(url, tmp_parquet)
+        pf = pq.ParquetFile(tmp_parquet)
+        # Read just the embedding column, in row-group batches, to bound memory.
+        for batch in pf.iter_batches(batch_size=10_000, columns=[LARGE_VEC_EMB_COLUMN]):
+          # list<float> column -> contiguous (n, dim) float32. to_numpy(zero_copy_only=False) on the
+          # flattened child values then reshape avoids a Python-level per-row loop.
+          col = batch.column(0)
+          flat = col.flatten().to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
+          n = len(col)
+          if n * LARGE_VEC_DIM != flat.size:
+            raise RuntimeError(f"unexpected emb width in {lang}/{shard_idx}: {flat.size} for {n} rows")
+          take = min(n, target_docs - docs_written)
+          out_f.write(np.ascontiguousarray(flat[: take * LARGE_VEC_DIM]).tobytes())
+          docs_written += take
+          if docs_written >= target_docs:
+            break
+        out_f.flush()
+        done_shards.add((lang, shard_idx))
+        with open(progress_path, "w") as pf_out:
+          json.dump({"docs_written": docs_written, "done_shards": sorted(done_shards)}, pf_out)
+        gb = docs_written * _LARGE_VEC_BYTES_PER_VEC / 1e9
+        rate = docs_written / max(1e-9, time.time() - t0)
+        print(f"  {lang}/{shard_idx}: {docs_written:,} docs ({gb:.1f} GB) {rate:,.0f} docs/s")
+  finally:
+    out_f.close()
+    if os.path.exists(tmp_parquet):
+      os.remove(tmp_parquet)
+
+  print(f"DONE: wrote {docs_written:,} docs ({docs_written * _LARGE_VEC_BYTES_PER_VEC / 1e9:.1f} GB) to {out_path}")
+  return out_path
 
 
 def runSetup(download):
@@ -158,5 +304,28 @@ if __name__ == "__main__":
     action="store_true",
     help="Download datasets to run benchmarks. A 6 GB compressed Wikipedia line doc file, and a 13 GB vectors file is downloaded from Apache mirrors",
   )
+  parser.add_argument(
+    "--build-large-vecs",
+    type=int,
+    metavar="TARGET_DOCS",
+    default=0,
+    help=(
+      "Stream Cohere-v3 multilingual Wikipedia parquet shards into a single raw float32 .vec of up to "
+      "TARGET_DOCS vectors (1024d, ~4KB/vec: e.g. 100_000_000 ~= 400GB). Resumable. Writes to ../data/. "
+      "NOTE: leave disk room for the LSH index (~1.6x the .vec) + spilling."
+    ),
+  )
+  parser.add_argument(
+    "--data-dir",
+    default=None,
+    help="Override the output data directory for --build-large-vecs (default: ../data relative to cwd).",
+  )
   args = parser.parse_args()
-  runSetup(args.download)
+  if args.build_large_vecs > 0:
+    cwd = os.getcwd()
+    parent = os.path.split(cwd)[0]
+    data_dir = args.data_dir or os.path.join(parent, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    build_large_vecs(data_dir, args.build_large_vecs)
+  else:
+    runSetup(args.download)

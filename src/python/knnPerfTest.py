@@ -47,6 +47,9 @@ from common import getLuceneDirFromGradleProperties
 # toggle between 'pread' and 'mmap' for concurrent random vector reads when smelling vectors -- pread is
 # maybe a bit faster?
 IO_METHOD = "pread"
+# Debug: pass -Dlsh.scanStats=true to the search JVM so LSHVectorsReader dumps columnar scan I/O stats
+# (filter-region bytes read vs payload bytes faulted, and survivor fraction) at exit. Off for real runs.
+LSH_SCAN_STATS = True
 # IO_METHOD = "mmap"
 
 
@@ -227,27 +230,50 @@ NOISY = True
 
 # test parameters. This script will run KnnGraphTester on every combination of these parameters
 PARAMS = {
-  "ndoc": (500_000,),
-  "maxConn": (64,),
-  "beamWidthIndex": (250,),
+  "ndoc": (100_000,),
+  "indexType": ("lsh",),
+  # IVF params (ignored for hnsw runs)
+  "ivfNlist": (1024,),
+  "ivfNprobe": (32,),
+  "ivfClusterTrainDims": (64,),
+  # LSH params (ignored unless indexType="lsh"). hashBits => up to 2^hashBits buckets;
+  # nprobe buckets probed per query; rerankFactor>1 enables exact full-precision rerank.
+  # bucketPoolFactor: multi-probe over-fetches bucketPoolFactor*nprobe buckets, re-ranks them by
+  # query-to-bucket-reference similarity, and scans the top nprobe best-first (with early termination).
+  "lshHashBits": (16,),
+  "lshNumTables": (1,),
+  "lshNprobe": (2048,),
+  "lshBucketPoolFactor": (2,),
+  "lshRerankFactor": (4,),
+  # Frozen PCA hash basis subspace dim (0 = data-independent hash, no PCA). >0 trains (mu,V) once from
+  # a doc sample and injects it, correcting rotational anisotropy while staying merge-stable. On the
+  # Cohere data m=256 lifts recall ~0.685 -> ~0.799 at matched params vs the data-independent hash.
+  "lshPcaDim": (16,),
+  # When True (and lshPcaDim>0), also train frozen per-table ITQ rotations that minimize sign-
+  # quantization loss on the used hash bits (tighter buckets, higher recall per candidate scanned).
+  "lshItq": (True,),
+  # OSQ quantizer precision for the LSH postings: 8 (default) or 4. 4-bit is UNPACKED (still 1 byte/dim,
+  # same scoring path and posting size as 8-bit), so this isolates the recall impact of lower precision.
+  # MEASURED: 4-bit recall is DOWN vs 8-bit with NO latency/size benefit (unpacked) — keep 8-bit. Only a
+  # PACKED 4-bit layout (half size) could help, and only when I/O-bound at >RAM scale. Set (8,4) to re-A/B.
+  "lshQuantizeBits": (8,),
+  # Index-time SPILLING: 0 (default) = off. >0 assigns each doc to its home bucket PLUS the buckets
+  # reached by flipping its N lowest-confidence signature bits, so a query finds it without probing more
+  # buckets — more recall per probe ⇒ lower nprobe ⇒ fewer docs visited (the only structural lever on
+  # `visited`, §18). Write-only (reader unchanged); index grows ≈(1+spillBits)×. Sweep e.g. (0,1,2,3).
+  "lshSpillBits": (1,),
+  # HNSW params (ignored for ivf runs); defaults maxConn=16, beamWidth=100 for good recall.
+  "maxConn": (16,),
+  "beamWidthIndex": (100,),
   "fanout": (100,),
-  "numMergeWorker": (24,),
-  "numMergeThread": (8,),
   "numSearchThread": (4,),
   "encoding": ("float32",),
   "metric": ("dot_product",),
-  "quantizeBits": (1, 2, 4),
-  "overSample": (
-    1,
-    2,
-    5,
-  ),
+  # quantizeBits=32 is inert (no -quantize flag); present because print_run_summary expects the key.
+  "quantizeBits": (32,),
   "topK": (100,),
-  "quantizeCompress": (True,),
   "forceMerge": (True,),
-  "nquery": (10000,),
-  "rerank": (True, False),
-  "rerankQuantizeBits": (32, 8, 4),
+  "nquery": (30,),
 }
 
 
@@ -1929,10 +1955,25 @@ def run_knn_benchmark(checkout, values, log_path):
   # Cohere Wikipedia en vectors - see cohere-v3-README.txt -- download your copy with "initial_setup.py -download"
   v3 = True
 
+  # Read ONLY from the large Cohere-v3 MULTILINGUAL .vec built by
+  #   initial_setup.py --build-large-vecs <N>
+  # (same 1024d unit-norm distribution as the bundled 1M sample, so the frozen PCA/ITQ basis stays
+  # comparable). LARGE_VEC_DOCS is the N you built; ndoc in PARAMS must be <= N. The query set stays
+  # the bundled 200K (same distribution). This is the >RAM regime where this codec is meant to win and
+  # where disk I/O finally matters (see findings.md §6/§13); the bundled 1M sample was HNSW's best case
+  # (fit in RAM). To go back to the 1M sample, point doc_vectors at the ...first1M.vec file.
+  LARGE_VEC_DOCS = 100_000_000
+
   if v3:
     dim = 1024
-    doc_vectors = "/lucenedata/enwiki/cohere-v3/cohere-v3-wikipedia-en-scattered-1024d.docs.vec"
-    query_vectors = "/lucenedata/enwiki/cohere-v3/cohere-v3-wikipedia-en-scattered-1024d.queries.vec"
+    #doc_vectors = f"/local/home/rikhil/data/cohere-v3-multilingual-1024d.docs.{LARGE_VEC_DOCS}.vec"
+    doc_vectors = f"/home/rikhil/data/cohere-v3-wikipedia-en-scattered-1024d.docs.first1M.vec"
+    if not os.path.exists(doc_vectors):
+      raise RuntimeError(
+        f"large doc vectors not found: {doc_vectors}\n"
+        f"  build them first:  python src/python/initial_setup.py --build-large-vecs {LARGE_VEC_DOCS}"
+      )
+    query_vectors = "/local/home/rikhil/data/cohere-v3-wikipedia-en-scattered-1024d.queries.first200K.vec"
   else:
     dim = 768
     doc_vectors = f"/lucenedata/enwiki/cohere-wikipedia-docs-{dim}d.vec"
@@ -1969,6 +2010,10 @@ def run_knn_benchmark(checkout, values, log_path):
     "-XX:+UnlockDiagnosticVMOptions",
     "-XX:+DebugNonSafepoints",
   ]
+
+  # Debug: dump LSH columnar scan I/O stats (filter vs payload bytes, survivor fraction) at JVM exit.
+  if LSH_SCAN_STATS:
+    cmd += ["-Dlsh.scanStats=true"]
 
   if DO_PROFILING:
     cmd += [
@@ -2735,6 +2780,9 @@ def build_java_base_cmd(checkout):
     "-XX:+UnlockDiagnosticVMOptions",
     "-XX:+DebugNonSafepoints",
   ]
+  # Debug: dump LSH columnar scan I/O stats (filter vs payload bytes, survivor fraction) at JVM exit.
+  if LSH_SCAN_STATS:
+    cmd += ["-Dlsh.scanStats=true"]
   cmd += ["knn.KnnGraphTester"]
   return cmd
 

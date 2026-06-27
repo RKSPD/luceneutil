@@ -56,6 +56,8 @@ import org.apache.lucene.codecs.lucene104.Lucene104HnswScalarQuantizedVectorsFor
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader;
+import org.apache.lucene.sandbox.codecs.ivf.IVFVectorsFormat;
+import org.apache.lucene.sandbox.codecs.lsh.LSHVectorsFormat;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
@@ -112,6 +114,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
@@ -144,7 +147,9 @@ public class KnnGraphTester implements FormatterLogger {
 
   enum IndexType {
     HNSW,
-    FLAT
+    FLAT,
+    IVF,
+    LSH
   }
 
   enum SearchType {
@@ -215,8 +220,41 @@ public class KnnGraphTester implements FormatterLogger {
   private int queryStartIndex;
   // whether to reorder the index using binary partitioning
   private boolean useBp;
-  // index type, e.g. flat, hnsw
+  // index type, e.g. flat, hnsw, ivf
   private IndexType indexType;
+  // IVF (org.apache.lucene.sandbox.codecs.ivf.IVFVectorsFormat) parameters
+  private int ivfNlist;
+  private int ivfNprobe;
+  private int ivfCentroidScanDims;
+  private int ivfCentroidRefineFactor;
+  private int ivfClusterTrainDims;
+  private int ivfRerankFactor;
+  // LSH (org.apache.lucene.sandbox.codecs.lsh.LSHVectorsFormat) parameters
+  private int lshHashBits;
+  private int lshNumTables;
+  private int lshNprobe;
+  private int lshBucketPoolFactor;
+  private int lshRerankFactor;
+  // OSQ posting precision: 8 (default) or 4 bits. Passed to the writer via the lsh.quantizeBits system
+  // property at index time; persisted per field as the encoding id so the reader reconstructs it.
+  private int lshQuantizeBits;
+  // Index-time SPILLING: 0 (default) = no spilling; >0 = also assign each doc to the buckets reached by
+  // flipping its N lowest-confidence signature bits, so a query finds it without probing more buckets
+  // (more recall per probe ⇒ lower nprobe ⇒ fewer docs visited). Passed to the writer via the
+  // lsh.spillBits system property at index time. Write-only (reader unchanged); ≈(1+spillBits)× postings.
+  private int lshSpillBits;
+  // LSH frozen PCA hash basis: subspace dim m (0 = data-independent hash, no PCA). When >0 the harness
+  // trains (mu,V) once from a sample of the doc vectors and injects it into the codec (merge-stable).
+  private int lshPcaDim;
+  // Trained-once frozen PCA basis, shared by index + force-merge codecs so all segments bucket
+  // identically (the concat-merge precondition). Null until trained / when lshPcaDim==0.
+  private float[] lshPcaMean;
+  private float[][] lshPcaBasis;
+  // When true (and PCA is on), also train frozen per-table ITQ rotations that minimize sign-quantization
+  // loss on the used hash bits (tighter buckets). Trained once alongside the PCA basis, shared by all
+  // segments (merge-stable). Null lshPcaItq => plain SimHash on the PCA subspace.
+  private boolean lshItq;
+  private float[][][] lshPcaItq;
   // oversampling, e.g. the multiple * k to gather before checking recall
   private float overSample;
   // whether to use two-phase reranking: HNSW retrieves overSample*topK candidates, then
@@ -255,6 +293,21 @@ public class KnnGraphTester implements FormatterLogger {
     numSearchThread = 0;
     queryStartIndex = 0;
     indexType = IndexType.HNSW;
+    ivfNlist = IVFVectorsFormat.DEFAULT_NLIST;
+    ivfNprobe = IVFVectorsFormat.DEFAULT_NPROBE;
+    ivfCentroidScanDims = IVFVectorsFormat.DEFAULT_CENTROID_SCAN_DIMS;
+    ivfCentroidRefineFactor = IVFVectorsFormat.DEFAULT_CENTROID_REFINE_FACTOR;
+    ivfClusterTrainDims = IVFVectorsFormat.DEFAULT_CLUSTER_TRAIN_DIMS;
+    ivfRerankFactor = IVFVectorsFormat.DEFAULT_RERANK_FACTOR;
+    lshHashBits = LSHVectorsFormat.DEFAULT_HASH_BITS;
+    lshNumTables = LSHVectorsFormat.DEFAULT_NUM_TABLES;
+    lshNprobe = LSHVectorsFormat.DEFAULT_NPROBE;
+    lshBucketPoolFactor = LSHVectorsFormat.DEFAULT_BUCKET_POOL_FACTOR;
+    lshRerankFactor = LSHVectorsFormat.DEFAULT_RERANK_FACTOR;
+    lshPcaDim = 0; // 0 = data-independent hash (no frozen PCA basis)
+    lshItq = false; // when true (and PCA on), also train frozen per-table ITQ rotations
+    lshQuantizeBits = 8; // OSQ posting precision (8 or 4)
+    lshSpillBits = 0; // index-time spilling off by default
     overSample = 1f;
     rerank = false;
     rerankQuantizeBits = 32;
@@ -270,6 +323,52 @@ public class KnnGraphTester implements FormatterLogger {
       throw new IllegalArgumentException("vectors file \"" + path + "\" does not contain a whole number of vectors?  size=" + in.size());
     }
     return in;
+  }
+
+  /**
+   * Trains the frozen LSH PCA hash basis ONCE from a sample of the doc vectors and stores it in
+   * {@link #lshPcaMean}/{@link #lshPcaBasis}. The sample is normalized the same way the codec
+   * normalizes documents (L2 for COSINE) so the trained basis matches the bucketing space. Sampling is
+   * a deterministic prefix of up to LSHHashTransform.MAX_SAMPLE vectors (training subsamples further).
+   */
+  private void trainLshPcaBasis(Path docVectorsPath) throws IOException {
+    final int maxSample = 50_000; // matches LSHHashTransform.MAX_SAMPLE
+    boolean cosine = similarityFunction == VectorSimilarityFunction.COSINE;
+    try (FileChannel in = getVectorFileChannel(docVectorsPath, dim, vectorEncoding, !quiet)) {
+      VectorReader reader = VectorReader.create(in, dim, vectorEncoding, 0);
+      int available = (int) Math.min((long) numDocs, in.size() / ((long) dim * vectorEncoding.byteSize));
+      int sampleSize = Math.min(maxSample, available);
+      float[][] sample = new float[sampleSize][];
+      for (int i = 0; i < sampleSize; i++) {
+        float[] v = reader.next(); // reused buffer -> copy
+        float[] copy = ArrayUtil.copyOfSubArray(v, 0, dim);
+        if (cosine) {
+          VectorUtil.l2normalize(copy);
+        }
+        sample[i] = copy;
+      }
+      lshPcaBasis = null;
+      lshPcaMean = null;
+      float[][] basis = LSHVectorsFormat.trainPcaBasis(sample, lshPcaDim, 42L);
+      if (basis != null) {
+        lshPcaMean = basis[0];
+        lshPcaBasis = java.util.Arrays.copyOfRange(basis, 1, basis.length);
+        log("LSH: trained frozen PCA basis m=%d from %d sampled docs\n", lshPcaBasis.length, sampleSize);
+        if (lshItq) {
+          lshPcaItq =
+              LSHVectorsFormat.trainPcaItq(
+                  sample, lshPcaMean, lshPcaBasis, lshHashBits, lshNumTables, 42L);
+          if (lshPcaItq != null) {
+            log("LSH: trained frozen per-table ITQ rotations c=%d for %d tables\n",
+                lshPcaItq[0].length, lshNumTables);
+          } else {
+            log("LSH: ITQ training skipped/degenerate; using plain SimHash on the PCA subspace\n");
+          }
+        }
+      } else {
+        log("LSH: PCA basis training skipped/degenerate (lshPcaDim=%d); using data-independent hash\n", lshPcaDim);
+      }
+    }
   }
 
   public static void main(String... args) throws Exception {
@@ -334,9 +433,103 @@ public class KnnGraphTester implements FormatterLogger {
             case "flat":
               indexType = IndexType.FLAT;
               break;
+            case "ivf":
+              indexType = IndexType.IVF;
+              break;
+            case "lsh":
+              indexType = IndexType.LSH;
+              break;
             default:
-              throw new IllegalArgumentException("-indexType can be 'hnsw' or 'flat' only");
+              throw new IllegalArgumentException(
+                  "-indexType can be 'hnsw', 'flat', 'ivf' or 'lsh' only");
           }
+          break;
+        case "-ivfNlist":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfNlist requires a following int");
+          }
+          ivfNlist = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfNprobe":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfNprobe requires a following int");
+          }
+          ivfNprobe = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfCentroidScanDims":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfCentroidScanDims requires a following int");
+          }
+          ivfCentroidScanDims = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfCentroidRefineFactor":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfCentroidRefineFactor requires a following int");
+          }
+          ivfCentroidRefineFactor = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfClusterTrainDims":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfClusterTrainDims requires a following int");
+          }
+          ivfClusterTrainDims = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfRerankFactor":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfRerankFactor requires a following int");
+          }
+          ivfRerankFactor = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshHashBits":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshHashBits requires a following int");
+          }
+          lshHashBits = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshNumTables":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshNumTables requires a following int");
+          }
+          lshNumTables = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshNprobe":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshNprobe requires a following int");
+          }
+          lshNprobe = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshBucketPoolFactor":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshBucketPoolFactor requires a following int");
+          }
+          lshBucketPoolFactor = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshRerankFactor":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshRerankFactor requires a following int");
+          }
+          lshRerankFactor = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshPcaDim":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshPcaDim requires a following int");
+          }
+          lshPcaDim = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshItq":
+          lshItq = true;
+          break;
+        case "-lshQuantizeBits":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshQuantizeBits requires a following int");
+          }
+          lshQuantizeBits = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshSpillBits":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshSpillBits requires a following int");
+          }
+          lshSpillBits = Integer.parseInt(args[++iarg]);
           break;
         case "-overSample":
           if (iarg == args.length - 1) {
@@ -611,7 +804,8 @@ public class KnnGraphTester implements FormatterLogger {
                                      quantize, quantizeBits, quantizeCompress,
                                      rerank, rerankQuantizeBits,
                                      parentJoin, filterStrategy, filterSelectivity, randomSeed,
-                                     docVectorsPath, numDocs, metric, forceMerge);
+                                     docVectorsPath, numDocs, metric, forceMerge,
+                                     lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaDim, lshItq, lshQuantizeBits, lshSpillBits);
     log("index key = %s\n", indexKey);
     
     if (indexPath == null) {
@@ -659,6 +853,23 @@ public class KnnGraphTester implements FormatterLogger {
         throw new IllegalArgumentException("-docs argument is required when indexing");
       }
 
+      // Select the LSH OSQ posting precision (8 or 4 bits) the writer will use. Read via the
+      // lsh.quantizeBits system property in LSHVectorsWriter.buildQuantizer; set before any segment
+      // flush AND before force-merge (the rebuild merge path re-quantizes), so all postings agree.
+      if (indexType == IndexType.LSH) {
+        System.setProperty("lsh.quantizeBits", Integer.toString(lshQuantizeBits));
+        // Index-time spilling factor (write-only); read in LSHVectorsWriter.spillBits(). Set before any
+        // segment flush AND before force-merge so flush and the rebuild-merge path agree (concat copies
+        // bytes verbatim, so it is spill-agnostic, but a rebuild must use the same spill factor).
+        System.setProperty("lsh.spillBits", Integer.toString(lshSpillBits));
+      }
+
+      // Train the frozen LSH PCA hash basis ONCE (if enabled) before building any segment, so every
+      // segment and the force-merge share the same (mu,V) and stay concat-mergeable.
+      if (indexType == IndexType.LSH && lshPcaDim > 0 && lshPcaMean == null) {
+        trainLshPcaBasis(docVectorsPath);
+      }
+
       KnnIndexer.FilterScheme indexTimeFilter;
 
       if (filterStrategy == null) {
@@ -674,7 +885,7 @@ public class KnnGraphTester implements FormatterLogger {
       KnnIndexer.IndexResult indexResult = new KnnIndexer(
         docVectorsPath,
         indexPath,
-        getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits),
+        getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits, ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor, lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq),
         numIndexThreads,
         vectorEncoding,
         dim,
@@ -977,7 +1188,10 @@ public class KnnGraphTester implements FormatterLogger {
                                        boolean rerank, int rerankQuantizeBits,
                                        boolean parentJoin, FilterStrategy filterStrategy,
                                        Float filterSelectivity, Long randomSeed,
-                                       Path docPath, int numDocs, String metric, boolean forceMerge)
+                                       Path docPath, int numDocs, String metric, boolean forceMerge,
+                                       int lshHashBits, int lshNumTables, int lshNprobe,
+                                       int lshBucketPoolFactor, int lshRerankFactor, int lshPcaDim,
+                                       boolean lshItq, int lshQuantizeBits, int lshSpillBits)
     throws IOException {
 
     List<String> suffix = new ArrayList<>();
@@ -1005,6 +1219,30 @@ public class KnnGraphTester implements FormatterLogger {
     
     if (indexType == IndexType.FLAT) {
       suffix.add("flat");
+    } else if (indexType == IndexType.LSH) {
+      // lshHashBits changes the on-disk bucketing. nprobe/rerankFactor are search-only but are
+      // PERSISTED in the index meta at write time (the reader is SPI-instantiated with no caller
+      // config), so a cached index bakes them in — include them here so a sweep reindexes per combo.
+      suffix.add("lsh");
+      suffix.add(Integer.toString(lshHashBits));
+      suffix.add("L" + lshNumTables);
+      suffix.add("np" + lshNprobe);
+      suffix.add("bpf" + lshBucketPoolFactor);
+      suffix.add("rr" + lshRerankFactor);
+      suffix.add("pca" + lshPcaDim);
+      if (lshItq) {
+        // ITQ changes the on-disk bucketing (and the persisted rotation), so a cached non-ITQ index
+        // must not be reused for an ITQ run.
+        suffix.add("itq");
+      }
+      // OSQ precision changes the persisted posting bytes + encoding id, so 8-bit and 4-bit indexes
+      // must not be reused for each other.
+      suffix.add("q" + lshQuantizeBits);
+      // Spilling changes which buckets each doc lands in (the on-disk postings), so a spilled index
+      // must not be reused for a non-spilled run (and vice versa). Omit when off to keep legacy keys.
+      if (lshSpillBits > 0) {
+        suffix.add("sp" + lshSpillBits);
+      }
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
       suffix.add(Integer.toString(maxConn));
@@ -1095,6 +1333,14 @@ public class KnnGraphTester implements FormatterLogger {
       log("flat has no graphs\n");
       return;
     }
+    if (indexType == IndexType.IVF) {
+      log("ivf has no graphs\n");
+      return;
+    }
+    if (indexType == IndexType.LSH) {
+      log("lsh has no graphs\n");
+      return;
+    }
     try (Directory dir = FSDirectory.open(indexPath);
          DirectoryReader reader = DirectoryReader.open(dir)) {
       for (LeafReaderContext context : reader.leaves()) {
@@ -1118,7 +1364,7 @@ public class KnnGraphTester implements FormatterLogger {
   @SuppressForbidden(reason = "Prints stuff")
   private double forceMerge() throws IOException, InterruptedException {
     IndexWriterConfig iwc = new IndexWriterConfig().setOpenMode(IndexWriterConfig.OpenMode.APPEND);
-    iwc.setCodec(getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits));
+    iwc.setCodec(getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits, ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor, lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq));
     KnnIndexer.TrackingConcurrentMergeScheduler tcms = new KnnIndexer.TrackingConcurrentMergeScheduler();
     iwc.setMergeScheduler(tcms);
     KnnIndexer.TrackingTieredMergePolicy ttmp = new KnnIndexer.TrackingTieredMergePolicy();
@@ -2209,7 +2455,37 @@ public class KnnGraphTester implements FormatterLogger {
 
   static Codec getCodec(int maxConn, int beamWidth, ExecutorService exec, int numMergeWorker,
                         boolean quantize, int quantizeBits, IndexType indexType,
-                        boolean rerank, int rerankQuantizeBits) {
+                        boolean rerank, int rerankQuantizeBits,
+                        int ivfNlist, int ivfNprobe, int ivfCentroidScanDims,
+                        int ivfCentroidRefineFactor, int ivfClusterTrainDims, int ivfRerankFactor,
+                        int lshHashBits, int lshNumTables, int lshNprobe, int lshBucketPoolFactor, int lshRerankFactor,
+        float[] lshPcaMean, float[][] lshPcaBasis, float[][][] lshPcaItq) {
+      if (indexType == IndexType.IVF) {
+          // Disk-searchable IVF: self-contained, bypasses the quantize/rerank paths above.
+          final KnnVectorsFormat ivfFormat =
+              new IVFVectorsFormat(
+                  ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor);
+          return new Lucene104Codec() {
+              @Override
+              public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+                  return ivfFormat;
+              }
+          };
+      }
+      if (indexType == IndexType.LSH) {
+          // Disk-searchable LSH: self-contained, bypasses the quantize/rerank paths. Bucketing is
+          // either data-independent (no PCA) or uses a FROZEN PCA basis (lshPcaMean/lshPcaBasis,
+          // trained once by the harness) that corrects rotational anisotropy while staying merge-stable.
+          final KnnVectorsFormat lshFormat =
+              new LSHVectorsFormat(lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor,
+                                   lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq);
+          return new Lucene104Codec() {
+              @Override
+              public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+                  return lshFormat;
+              }
+          };
+      }
       KnnVectorsFormat knnVectorsFormat;
       if (quantize) {
           knnVectorsFormat = switch (quantizeBits) {
@@ -2217,26 +2493,31 @@ public class KnnGraphTester implements FormatterLogger {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
               };
               case 2 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
               };
               case 4 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
               };
               case 7 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
               };
               case 8 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
               };
               default -> throw new IllegalArgumentException("Unsupported quantizeBits: " + quantizeBits);
           };

@@ -1812,6 +1812,9 @@ def getClassPath(checkout):
 
   cp.append(core_jar_file)  # noqa: FURB113
   cp.append("%s/lucene/sandbox/build/classes/java/main" % path)
+  # sandbox resources (e.g. META-INF/services SPI registrations for IVF/LSH/Faiss codecs) are
+  # emitted to resources/main, not the classes dir, so they must be added explicitly.
+  cp.append("%s/lucene/sandbox/build/resources/main" % path)
   cp.append("%s/lucene/misc/build/classes/java/main" % path)
   cp.append("%s/lucene/facet/build/classes/java/main" % path)
   cp.append("%s/lucene/analysis/common/build/classes/java/main" % path)
