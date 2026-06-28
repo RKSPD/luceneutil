@@ -131,7 +131,11 @@ if "JAVA_EXE" not in globals():
 if "JAVAC_EXE" not in globals():
   JAVAC_EXE = f"{java_bin}javac"
 if "JAVA_COMMAND" not in globals():
-  JAVA_COMMAND = "%s -server -Xms2g -Xmx2g --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:+UseParallelGC" % JAVA_EXE
+  # JVM heap is overridable via the KNN_HEAP env var (e.g. "2g", "512m") so callers like run_knn_bench.sh
+  # can cap RAM without editing this file -- essential for the >RAM experiment (findings.md §20), where
+  # the index must exceed the heap to exercise the disk/off-heap path. Default 2g.
+  KNN_HEAP = os.environ.get("KNN_HEAP", "2g")
+  JAVA_COMMAND = "%s -server -Xms%s -Xmx%s --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:+UseParallelGC" % (JAVA_EXE, KNN_HEAP, KNN_HEAP)
 
 print("use java command %s" % JAVA_COMMAND)
 

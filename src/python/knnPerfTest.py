@@ -41,6 +41,7 @@ import benchUtil
 import constants
 import knnExactNN
 import ps_head
+import ram_monitor
 from benchUtil import GNUPLOT_PATH, PERF_EXE
 from common import getLuceneDirFromGradleProperties
 
@@ -50,6 +51,16 @@ IO_METHOD = "pread"
 # Debug: pass -Dlsh.scanStats=true to the search JVM so LSHVectorsReader dumps columnar scan I/O stats
 # (filter-region bytes read vs payload bytes faulted, and survivor fraction) at exit. Off for real runs.
 LSH_SCAN_STATS = True
+# When True, pass -Dlsh.offHeapCentroids=true so LSHVectorsReader does NOT pin per-bucket centroids on
+# the heap (reference centroids reconstructed from the bucket code; TRUE centroids read from the mmap'd
+# index per probed bucket). Drops per-bucket heap from ~2*dim floats to ~8 bytes -- needed at the >RAM /
+# high-bucket-count scale -- at the cost of recompute + small reads per probed bucket. Leave False when
+# the whole index fits in RAM (the eager resident arrays are then pure speed upside, ~2x lower latency).
+LSH_OFF_HEAP_CENTROIDS = False
+# Number of concurrent indexing threads passed to KnnGraphTester (-numIndexThreads). Affects build
+# wall-clock only; with -forceMerge the final single-segment index is concurrency-independent. This box
+# has 12 cores. Used at both the search-and-stats and the search-only command builders below.
+NUM_INDEX_THREADS = 12
 # IO_METHOD = "mmap"
 
 
@@ -67,7 +78,9 @@ def advise_will_need(file_name, offset_bytes=0, length_bytes=0):
 
   with open(file_name, "rb") as f:
     if IO_METHOD == "pread":
-      os.posix_fadvise(f.fileno(), offset_bytes, length_bytes, os.POSIX_FADV_WILLNEED)
+      # os.posix_fadvise is Linux-only; skip the hint where it is unavailable.
+      if hasattr(os, "posix_fadvise"):
+        os.posix_fadvise(f.fileno(), offset_bytes, length_bytes, os.POSIX_FADV_WILLNEED)
     elif IO_METHOD == "mmap":
       # map the part of the file we need
       mm = mmap.mmap(f.fileno(), length_bytes, offset=offset_bytes, access=mmap.ACCESS_READ)
@@ -103,7 +116,12 @@ def advise_will_need(file_name, offset_bytes=0, length_bytes=0):
 # uses CPUTime sampling (newly available/experimental in Java 25, seems to work on the tasks benchmark)
 DO_PROFILING = False
 DO_PS = True
-DO_VMSTAT = True
+# vmstat is Linux-only; disable when the executable is unavailable (e.g. macOS)
+DO_VMSTAT = benchUtil.VMSTAT_PATH is not None
+# Live per-run RAM (RSS) monitor for the search/index JVM: prints a \r-updating gauge to the terminal,
+# logs (elapsed,rss_mb) to a CSV, and writes a per-run RSS-over-time HTML chart. Tracks the codec's actual
+# resident footprint (heap + faulted mmap pages) -- the number the off-heap-centroids work targets (§20).
+DO_RAM_MONITOR = True
 
 # precompute exact NN using numpy (multi-threaded BLAS matmul).  when False,
 # KnnGraphTester.java computes exact NN itself (slower, single-threaded Java).
@@ -230,7 +248,7 @@ NOISY = True
 
 # test parameters. This script will run KnnGraphTester on every combination of these parameters
 PARAMS = {
-  "ndoc": (100_000,),
+  "ndoc": (1_000_000,),
   "indexType": ("lsh",),
   # IVF params (ignored for hnsw runs)
   "ivfNlist": (1024,),
@@ -240,11 +258,11 @@ PARAMS = {
   # nprobe buckets probed per query; rerankFactor>1 enables exact full-precision rerank.
   # bucketPoolFactor: multi-probe over-fetches bucketPoolFactor*nprobe buckets, re-ranks them by
   # query-to-bucket-reference similarity, and scans the top nprobe best-first (with early termination).
-  "lshHashBits": (16,),
-  "lshNumTables": (1,),
-  "lshNprobe": (2048,),
-  "lshBucketPoolFactor": (2,),
-  "lshRerankFactor": (4,),
+  "lshHashBits": (12,),  # NOTE: hard cap is MAX_HASH_BITS=30 (bucket code must fit a positive int)
+  "lshNumTables": (2,),
+  "lshNprobe": (128,),
+  "lshBucketPoolFactor": (4,),
+  "lshRerankFactor": (1,),
   # Frozen PCA hash basis subspace dim (0 = data-independent hash, no PCA). >0 trains (mu,V) once from
   # a doc sample and injects it, correcting rotational anisotropy while staying merge-stable. On the
   # Cohere data m=256 lifts recall ~0.685 -> ~0.799 at matched params vs the data-independent hash.
@@ -262,6 +280,15 @@ PARAMS = {
   # buckets — more recall per probe ⇒ lower nprobe ⇒ fewer docs visited (the only structural lever on
   # `visited`, §18). Write-only (reader unchanged); index grows ≈(1+spillBits)×. Sweep e.g. (0,1,2,3).
   "lshSpillBits": (1,),
+  # SOAR spill selection (ScaNN, Sun et al. 2023): when True AND lshSpillBits>0, choose spill buckets by
+  # the anisotropic residual loss (steer spills toward query directions the home bucket mis-scores)
+  # instead of the lowest-|projection| geometry. Same K and on-disk layout as plain spilling, so it is
+  # merge-stable and matched on INDEX SIZE — a clean A/B for "does SOAR reach matched recall at lower
+  # nprobe?". No-op unless lshSpillBits>0. Sweep e.g. (False, True).
+  "lshSoar": (False,),
+  # SOAR orthogonality weight lambda (used only when lshSoar). ScaNN reports robustness ~1.0-1.5;
+  # 0 ~= plain nearest-centroid spill selection. Sweep e.g. (0.5, 1.0, 1.5).
+  "lshSoarLambda": (1,),
   # HNSW params (ignored for ivf runs); defaults maxConn=16, beamWidth=100 for good recall.
   "maxConn": (16,),
   "beamWidthIndex": (100,),
@@ -273,7 +300,7 @@ PARAMS = {
   "quantizeBits": (32,),
   "topK": (100,),
   "forceMerge": (True,),
-  "nquery": (30,),
+  "nquery": (1000,),
 }
 
 
@@ -391,22 +418,27 @@ def _print_dim_line(d, mean, std, pct_zeros, counts, labels, dim_idx_width):
 
 def _read_vectors_pread(file_name, sample_indices, vec_size_bytes):
   """Generator that issues concurrent readahead hints and yields vectors via pread."""
+  # os.posix_fadvise is Linux-only; on macOS/Windows it is absent, so the
+  # readahead hints are simply skipped (pread still works correctly).
+  have_fadvise = hasattr(os, "posix_fadvise")
   with open(file_name, "rb") as f:
     fd = f.fileno()
 
     # hint random access for the whole file, to suppress wasteful readahead
-    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+    if have_fadvise:
+      os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
 
-    # concurrently send all requests to the OS as hints
-    for vec_idx in sample_indices:
-      os.posix_fadvise(fd, vec_idx * vec_size_bytes, vec_size_bytes, os.POSIX_FADV_WILLNEED)
+      # concurrently send all requests to the OS as hints
+      for vec_idx in sample_indices:
+        os.posix_fadvise(fd, vec_idx * vec_size_bytes, vec_size_bytes, os.POSIX_FADV_WILLNEED)
 
     # yield vectors; they should be pre-fetched by the kernel
     for vec_idx in sample_indices:
       yield vec_idx, np.frombuffer(os.pread(fd, vec_size_bytes, vec_idx * vec_size_bytes), dtype="<f4")
 
     # hint sequential access for the subsequent (sequential) indexing test
-    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+    if have_fadvise:
+      os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
 
 
 def _read_vectors_mmap(file_name, sample_indices, vec_size_bytes, dim):
@@ -1966,14 +1998,14 @@ def run_knn_benchmark(checkout, values, log_path):
 
   if v3:
     dim = 1024
-    #doc_vectors = f"/local/home/rikhil/data/cohere-v3-multilingual-1024d.docs.{LARGE_VEC_DOCS}.vec"
-    doc_vectors = f"/home/rikhil/data/cohere-v3-wikipedia-en-scattered-1024d.docs.first1M.vec"
+    #doc_vectors = f"/Users/rikhil/Desktop/data/cohere-v3-multilingual-1024d.docs.{LARGE_VEC_DOCS}.vec"
+    doc_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.docs.first1M.vec"
     if not os.path.exists(doc_vectors):
       raise RuntimeError(
         f"large doc vectors not found: {doc_vectors}\n"
         f"  build them first:  python src/python/initial_setup.py --build-large-vecs {LARGE_VEC_DOCS}"
       )
-    query_vectors = "/local/home/rikhil/data/cohere-v3-wikipedia-en-scattered-1024d.queries.first200K.vec"
+    query_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.queries.first200K.vec"
   else:
     dim = 768
     doc_vectors = f"/lucenedata/enwiki/cohere-wikipedia-docs-{dim}d.vec"
@@ -2014,6 +2046,9 @@ def run_knn_benchmark(checkout, values, log_path):
   # Debug: dump LSH columnar scan I/O stats (filter vs payload bytes, survivor fraction) at JVM exit.
   if LSH_SCAN_STATS:
     cmd += ["-Dlsh.scanStats=true"]
+
+  if LSH_OFF_HEAP_CENTROIDS:
+    cmd += ["-Dlsh.offHeapCentroids=true"]
 
   if DO_PROFILING:
     cmd += [
@@ -2123,7 +2158,7 @@ def run_knn_benchmark(checkout, values, log_path):
         "-search-and-stats",
         query_vectors,
         "-numIndexThreads",
-        "8",
+        str(NUM_INDEX_THREADS),
         # "-metric",
         # "mip",
         # "-parentJoin",
@@ -2180,8 +2215,17 @@ def run_knn_benchmark(checkout, values, log_path):
     else:
       print("WARNING: vmstat is disabled!")
 
+    ram_mon = None  # bound before the try so the finally can reference it even if Popen throws
     try:
       job = subprocess.Popen(this_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8")
+
+      # Live RAM monitor on the just-launched search/index JVM (samples job.pid's RSS on a bg thread).
+      if DO_RAM_MONITOR:
+        ram_csv_file_name = get_unique_log_name(log_path, "ram").replace(".log", ".csv")
+        ram_label = f"{pv.get('indexType', '?')} ndoc={pv.get('ndoc', '?')}"
+        ram_mon = ram_monitor.RAMMonitor(job.pid, ram_csv_file_name, label=ram_label)
+        print(f"saving live RAM (RSS) monitor: {ram_csv_file_name}")
+
       re_summary = re.compile(r"^SUMMARY: (.*?)$", re.MULTILINE)
       re_scores_path = re.compile(r"^EXACT_NN_SCORES_PATH: (.+)$")
       re_nn_metric = re.compile(r"^EXACT_NN_METRIC: (.+)$")
@@ -2233,6 +2277,14 @@ def run_knn_benchmark(checkout, values, log_path):
         if "Exception in" in line:
           hit_exception = True
     finally:
+      if DO_RAM_MONITOR and ram_mon is not None:
+        peak_mb = ram_mon.stop()
+        heap_str = f"{ram_mon.peak_heap_mb:.1f} MB" if ram_mon.have_heap else "n/a (no jstat?)"
+        print(
+          f"peak RSS for this run: {peak_mb:.1f} MB  |  peak JVM heap used: {heap_str}  "
+          f"(chart: {ram_mon.html_file_name})"
+        )
+
       if DO_PS:
         print("now stop ps process...")
         ps_process.stop()
@@ -2240,7 +2292,8 @@ def run_knn_benchmark(checkout, values, log_path):
       if DO_VMSTAT:
         print(f"now stop vmstat (pid={vmstat_process.pid})...")
         # TODO: messy!  can we get process group working so we can kill bash and its child reliably?
-        subprocess.check_call(["pkill", "-u", benchUtil.get_username(), "vmstat"])
+        # pkill returns 1 when no process matched (already exited); that is not an error here
+        subprocess.call(["pkill", "-u", benchUtil.get_username(), "vmstat"])
         if vmstat_process.poll() is None:
           raise RuntimeError("failed to kill vmstat child process?  pid={vmstat_process.pid}")
 
@@ -2783,6 +2836,8 @@ def build_java_base_cmd(checkout):
   # Debug: dump LSH columnar scan I/O stats (filter vs payload bytes, survivor fraction) at JVM exit.
   if LSH_SCAN_STATS:
     cmd += ["-Dlsh.scanStats=true"]
+  if LSH_OFF_HEAP_CENTROIDS:
+    cmd += ["-Dlsh.offHeapCentroids=true"]
   cmd += ["knn.KnnGraphTester"]
   return cmd
 
@@ -2844,7 +2899,7 @@ def run_single_knn_iteration(checkout, params, dim, doc_vectors, query_vectors, 
       "-search-and-stats",
       str(query_vectors),
       "-numIndexThreads",
-      "8",
+      str(NUM_INDEX_THREADS),
     ]
   )
 

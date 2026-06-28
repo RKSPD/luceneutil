@@ -243,6 +243,12 @@ public class KnnGraphTester implements FormatterLogger {
   // (more recall per probe ⇒ lower nprobe ⇒ fewer docs visited). Passed to the writer via the
   // lsh.spillBits system property at index time. Write-only (reader unchanged); ≈(1+spillBits)× postings.
   private int lshSpillBits;
+  // SOAR (anisotropic) spill selection: when true (and lshSpillBits>0), spill buckets are chosen by the
+  // ScaNN SOAR residual loss instead of the lowest-|projection| geometry — same K and on-disk layout, so
+  // merge-stable and matched on index size for an A/B. Passed via the lsh.soar / lsh.soarLambda system
+  // properties at index time. lshSoarLambda is the orthogonality weight (default 1.0).
+  private boolean lshSoar;
+  private double lshSoarLambda;
   // LSH frozen PCA hash basis: subspace dim m (0 = data-independent hash, no PCA). When >0 the harness
   // trains (mu,V) once from a sample of the doc vectors and injects it into the codec (merge-stable).
   private int lshPcaDim;
@@ -308,6 +314,8 @@ public class KnnGraphTester implements FormatterLogger {
     lshItq = false; // when true (and PCA on), also train frozen per-table ITQ rotations
     lshQuantizeBits = 8; // OSQ posting precision (8 or 4)
     lshSpillBits = 0; // index-time spilling off by default
+    lshSoar = false; // SOAR spill selection off by default (plain lowest-|projection| spilling)
+    lshSoarLambda = 1.0; // SOAR orthogonality weight (used only when lshSoar && lshSpillBits>0)
     overSample = 1f;
     rerank = false;
     rerankQuantizeBits = 32;
@@ -530,6 +538,15 @@ public class KnnGraphTester implements FormatterLogger {
             throw new IllegalArgumentException("-lshSpillBits requires a following int");
           }
           lshSpillBits = Integer.parseInt(args[++iarg]);
+          break;
+        case "-lshSoar":
+          lshSoar = true;
+          break;
+        case "-lshSoarLambda":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshSoarLambda requires a following double");
+          }
+          lshSoarLambda = Double.parseDouble(args[++iarg]);
           break;
         case "-overSample":
           if (iarg == args.length - 1) {
@@ -805,7 +822,8 @@ public class KnnGraphTester implements FormatterLogger {
                                      rerank, rerankQuantizeBits,
                                      parentJoin, filterStrategy, filterSelectivity, randomSeed,
                                      docVectorsPath, numDocs, metric, forceMerge,
-                                     lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaDim, lshItq, lshQuantizeBits, lshSpillBits);
+                                     ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor,
+                                     lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaDim, lshItq, lshQuantizeBits, lshSpillBits, lshSoar, lshSoarLambda);
     log("index key = %s\n", indexKey);
     
     if (indexPath == null) {
@@ -862,6 +880,11 @@ public class KnnGraphTester implements FormatterLogger {
         // segment flush AND before force-merge so flush and the rebuild-merge path agree (concat copies
         // bytes verbatim, so it is spill-agnostic, but a rebuild must use the same spill factor).
         System.setProperty("lsh.spillBits", Integer.toString(lshSpillBits));
+        // SOAR spill-selection (write-only, read in LSHVectorsWriter.soarEnabled/soarLambda). Same
+        // timing rationale as lsh.spillBits: set before flush AND force-merge so the rebuild-merge path
+        // (if taken) chooses the same spill buckets as flush. No-op unless lshSpillBits>0.
+        System.setProperty("lsh.soar", Boolean.toString(lshSoar));
+        System.setProperty("lsh.soarLambda", Double.toString(lshSoarLambda));
       }
 
       // Train the frozen LSH PCA hash basis ONCE (if enabled) before building any segment, so every
@@ -1189,9 +1212,12 @@ public class KnnGraphTester implements FormatterLogger {
                                        boolean parentJoin, FilterStrategy filterStrategy,
                                        Float filterSelectivity, Long randomSeed,
                                        Path docPath, int numDocs, String metric, boolean forceMerge,
+                                       int ivfNlist, int ivfNprobe, int ivfCentroidScanDims,
+                                       int ivfCentroidRefineFactor, int ivfClusterTrainDims, int ivfRerankFactor,
                                        int lshHashBits, int lshNumTables, int lshNprobe,
                                        int lshBucketPoolFactor, int lshRerankFactor, int lshPcaDim,
-                                       boolean lshItq, int lshQuantizeBits, int lshSpillBits)
+                                       boolean lshItq, int lshQuantizeBits, int lshSpillBits,
+                                       boolean lshSoar, double lshSoarLambda)
     throws IOException {
 
     List<String> suffix = new ArrayList<>();
@@ -1219,6 +1245,19 @@ public class KnnGraphTester implements FormatterLogger {
     
     if (indexType == IndexType.FLAT) {
       suffix.add("flat");
+    } else if (indexType == IndexType.IVF) {
+      // nlist + clusterTrainDims are write-time params (they change the clustering / on-disk
+      // postings). nprobe/centroidScanDims/centroidRefineFactor/rerankFactor are search-time but are
+      // PERSISTED in the index meta at write time (the reader is SPI-instantiated with no caller
+      // config -- see IVFVectorsWriter), so a cached index bakes them in -- include them all here so a
+      // sweep reindexes per combo (and so an IVF run never reuses an HNSW index dir).
+      suffix.add("ivf");
+      suffix.add("nl" + ivfNlist);
+      suffix.add("ctd" + ivfClusterTrainDims);
+      suffix.add("np" + ivfNprobe);
+      suffix.add("csd" + ivfCentroidScanDims);
+      suffix.add("crf" + ivfCentroidRefineFactor);
+      suffix.add("rr" + ivfRerankFactor);
     } else if (indexType == IndexType.LSH) {
       // lshHashBits changes the on-disk bucketing. nprobe/rerankFactor are search-only but are
       // PERSISTED in the index meta at write time (the reader is SPI-instantiated with no caller
@@ -1242,6 +1281,12 @@ public class KnnGraphTester implements FormatterLogger {
       // must not be reused for a non-spilled run (and vice versa). Omit when off to keep legacy keys.
       if (lshSpillBits > 0) {
         suffix.add("sp" + lshSpillBits);
+        // SOAR only affects WHICH buckets spill copies go to, so it only matters when spilling is on.
+        // It changes the on-disk postings, so a SOAR index must not be reused for a non-SOAR run, and
+        // each lambda is a distinct bucketing. Omit when off to keep legacy (plain-spill) keys stable.
+        if (lshSoar) {
+          suffix.add("soar" + lshSoarLambda);
+        }
       }
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
