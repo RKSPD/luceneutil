@@ -57,10 +57,54 @@ LSH_SCAN_STATS = True
 # high-bucket-count scale -- at the cost of recompute + small reads per probed bucket. Leave False when
 # the whole index fits in RAM (the eager resident arrays are then pure speed upside, ~2x lower latency).
 LSH_OFF_HEAP_CENTROIDS = False
+# When True, pass -Dlsh.positionalScan=true so LSHVectorsReader's per-bucket scan reads filter pairs +
+# survivor payload rows POSITIONALLY off a single whole-file random-access view (created once per query)
+# instead of allocating a fresh filter slice + payload view and issuing a prefetch (madvise WILLNEED) per
+# probed bucket -- i.e. it drops O(nprobe) view allocations + syscalls/query. Result-neutral (bit-identical
+# bytes/order), reader-only, so it needs no reindex: A/B it by toggling this on the same index. Most likely
+# to help at high nprobe and warm/in-RAM (where the dropped prefetch did nothing but cost). NOTE: opposed to
+# LSH_OFF_HEAP_CENTROIDS in the >RAM/cold regime, where the explicit prefetch front-runs the page fault --
+# measure the two together there, not just warm.
+LSH_POSITIONAL_SCAN = False
+# When True, pass -Dlsh.hnswRouting=true so LSHVectorsReader selects buckets by navigating an in-RAM HNSW
+# graph over the bucket centroids (built at reader open) instead of query-directed Hamming multi-probe.
+# Multi-probe can only reach buckets Hamming-near the query's code; the graph reaches centroid-near but
+# Hamming-far buckets too, so the searcher visits FEWER, better buckets at matched recall -- letting
+# lshHashBits be pushed high (small buckets, precision retained on quantize) without the router losing the
+# right ones. Reader-only and search-time: the graph is a RAM-only DERIVED structure, never persisted, so
+# the on-disk format and concat merge are untouched and NO reindex is needed -- A/B it by toggling on the
+# same index (like LSH_POSITIONAL_SCAN). Requires the eager centroid path, so it is INCOMPATIBLE with
+# LSH_OFF_HEAP_CENTROIDS (which keeps no resident centroid arrays to build a graph over).
+LSH_HNSW_ROUTING = True
+# HNSW routing graph params (only used when LSH_HNSW_ROUTING). hnswM = max connections per node (graph
+# fanout), hnswBeamWidth = construction-time beam, hnswOverquery = search-time pool multiplier (the router
+# asks the graph for hnswOverquery * bucketPoolFactor * nprobe centroids per table, mirroring multi-probe's
+# over-fetch). None => use the codec defaults (16 / 100 / 1).
+LSH_HNSW_M = 20
+LSH_HNSW_BEAM_WIDTH = 300
+LSH_HNSW_OVERQUERY = 1
+# When True, pass -Dlsh.routeOnReferenceCentroids=true so the routing graph is built over REFERENCE
+# centroids (pure function of the bucket code) instead of the default TRUE centroids (empirical member
+# means). Reference centroids are merge-invariant (identical in every segment / after any merge), the
+# prerequisite for a persisted/shared routing graph; true centroids route better but change with bucket
+# membership so the graph must be rebuilt per merged segment. This A/Bs the routing-quality gap: as
+# hashBits rises the SimHash wedge narrows and reference -> true, so the gap should shrink at high bits.
+# Search-time, reader-only (no reindex) — toggle on the same index. Routing-graph SOURCE only; the
+# downstream pool re-rank still uses true centroids, so this isolates graph quality, not final scoring.
+LSH_ROUTE_ON_REFERENCE_CENTROIDS = False
+# When True, pass -Dlsh.referenceCentroidsOnly=true so the WRITER skips per-bucket TRUE centroids
+# entirely (no compute, no dim-float on-disk block, and — the big win — no count-weighted recombine +
+# radius shift in the concat merge, since reference centroids are identical across segments). The
+# reader falls back to the code-derived REFERENCE centroid for routing, pool re-rank, AND the scan
+# bound (radius is reference-anchored at write so the early-termination bound stays admissible). This
+# is the merge-speed / merge-invariant-graph direction: costs some routing/bound precision (wedge axis
+# vs member mean) — small at high hashBits (narrow wedges), larger at low bits. WRITE-TIME: changes the
+# on-disk format (centroidsLength==0), so it IS effectively in the index and a sweep reindexes per value.
+LSH_REFERENCE_CENTROIDS_ONLY = True
 # Number of concurrent indexing threads passed to KnnGraphTester (-numIndexThreads). Affects build
 # wall-clock only; with -forceMerge the final single-segment index is concurrency-independent. This box
 # has 12 cores. Used at both the search-and-stats and the search-only command builders below.
-NUM_INDEX_THREADS = 12
+NUM_INDEX_THREADS = 8
 # IO_METHOD = "mmap"
 
 
@@ -127,7 +171,13 @@ DO_RAM_MONITOR = True
 # KnnGraphTester.java computes exact NN itself (slower, single-threaded Java).
 USE_NUMPY_EXACT_NN = True
 
-# Enable to also catch duplicates within the doc set or within the query set
+# Run check_vector_overlap (doc-vs-query duplicate / test-on-train scan). This hashes every doc vector
+# in pure Python (O(ndoc)) and holds an ndoc-entry dict in RAM, which is prohibitively slow and memory
+# hungry at large ndoc (e.g. 20M -> hangs + OOMs). Off by default; the docs and queries here come from
+# distinct files/ranges, so the scan is unnecessary. Enable only for small ndoc when validating a new
+# dataset for accidental train/test overlap.
+CHECK_VECTOR_OVERLAP = False
+# Enable to also catch duplicates within the doc set or within the query set (requires CHECK_VECTOR_OVERLAP)
 CHECK_DOC_DOC_DUPLICATES = False
 CHECK_QUERY_QUERY_DUPLICATES = False
 
@@ -252,28 +302,37 @@ PARAMS = {
   "indexType": ("lsh",),
   # IVF params (ignored for hnsw runs)
   "ivfNlist": (1024,),
-  "ivfNprobe": (32,),
+  "ivfNprobe": (64,),
   "ivfClusterTrainDims": (64,),
   # LSH params (ignored unless indexType="lsh"). hashBits => up to 2^hashBits buckets;
   # nprobe buckets probed per query; rerankFactor>1 enables exact full-precision rerank.
   # bucketPoolFactor: multi-probe over-fetches bucketPoolFactor*nprobe buckets, re-ranks them by
   # query-to-bucket-reference similarity, and scans the top nprobe best-first (with early termination).
-  "lshHashBits": (12,),  # NOTE: hard cap is MAX_HASH_BITS=30 (bucket code must fit a positive int)
-  "lshNumTables": (2,),
-  "lshNprobe": (128,),
-  "lshBucketPoolFactor": (4,),
+  "lshHashBits": (17,),  # NOTE: hard cap is MAX_HASH_BITS=30 (bucket code must fit a positive int)
+  "lshNumTables": (1,),
+  "lshNprobe": (600,),
+  "lshBucketPoolFactor": (2,),
   "lshRerankFactor": (1,),
   # Frozen PCA hash basis subspace dim (0 = data-independent hash, no PCA). >0 trains (mu,V) once from
   # a doc sample and injects it, correcting rotational anisotropy while staying merge-stable. On the
   # Cohere data m=256 lifts recall ~0.685 -> ~0.799 at matched params vs the data-independent hash.
-  "lshPcaDim": (16,),
+  "lshPcaDim": (20,),
   # When True (and lshPcaDim>0), also train frozen per-table ITQ rotations that minimize sign-
   # quantization loss on the used hash bits (tighter buckets, higher recall per candidate scanned).
   "lshItq": (True,),
-  # OSQ quantizer precision for the LSH postings: 8 (default) or 4. 4-bit is UNPACKED (still 1 byte/dim,
-  # same scoring path and posting size as 8-bit), so this isolates the recall impact of lower precision.
-  # MEASURED: 4-bit recall is DOWN vs 8-bit with NO latency/size benefit (unpacked) — keep 8-bit. Only a
-  # PACKED 4-bit layout (half size) could help, and only when I/O-bound at >RAM scale. Set (8,4) to re-A/B.
+  # OSQ posting precision for the LSH postings: 8 (default), 4, or 1.
+  #   8 = symmetric unsigned byte (1 byte/dim).
+  #   4 = UNPACKED 4-bit (still 1 byte/dim, same posting size & scoring path as 8-bit) — isolates the
+  #       recall impact of lower precision. MEASURED: recall DOWN vs 8-bit, NO size/latency benefit. Skip.
+  #   1 = RaBitQ BINARY: 1-bit packed doc (dim/8 bytes) + 4-bit transposed query, asymmetric int4 dot.
+  #       ~6.9x smaller postings (the real packed layout win 4-bit lacked) => ~6.8x smaller no-raw index
+  #       (crosses under box RAM at 20M). Merge-stable (quantizes vs the code-derived centroid). Phase 1
+  #       is quantized-only (NO rerank) — recall recovery untuned; expect to raise nprobe/spill or
+  #       re-enable rerank. MEASURED-NEGATIVE on this (unit-norm Cohere) data: killed through three doors
+  #       — quantized-only 25% scan = 0.6; coverage-inert; rerank=2 @ 100% visited = only 0.92 (1-bit
+  #       misranks ~8% of true neighbors out of the rerank pool). Root cause: 1 bit/dim destroys the
+  #       subspace magnitude this data's signal lives in. Metric-invariant (unit-norm). Parked; keep 8-bit.
+  #       See findings §24b. (Re-A/B only on a NON-normalized / lower-recall-target corpus.)
   "lshQuantizeBits": (8,),
   # Index-time SPILLING: 0 (default) = off. >0 assigns each doc to its home bucket PLUS the buckets
   # reached by flipping its N lowest-confidence signature bits, so a query finds it without probing more
@@ -289,9 +348,24 @@ PARAMS = {
   # SOAR orthogonality weight lambda (used only when lshSoar). ScaNN reports robustness ~1.0-1.5;
   # 0 ~= plain nearest-centroid spill selection. Sweep e.g. (0.5, 1.0, 1.5).
   "lshSoarLambda": (1,),
+  # When True, DROP the stored full-precision originals (.vec/.vemf written empty) via
+  # -Dlsh.storeRawVectors=false. The raw float32 copy is the DOMINANT merge cost at >RAM scale (~80% of
+  # merge I/O: ~410GB at 100M×1024d, vs ~105GB×(1+spill)×tables of quantized postings the concat path
+  # actually needs), so dropping it is the structural force-merge lever. SAFE ONLY when: rerank is off
+  # (lshRerankFactor=1 — §10 measured rerank inert on this data), queries are UNFILTERED (the exact-search
+  # fallback needs originals), and you don't run CheckIndex on the result. Concat merge + quantized search
+  # are unaffected. Write-only, persisted per field (VERSION_NO_RAW). Sweep e.g. (False, True). See §22.
+  "lshNoRaw": (True,),
+  # Per-segment LSH search parallelism: number of threads the reader uses to scan ONE segment's selected
+  # buckets per query (1 = sequential, the original path). The bucket scan is embarrassingly parallel and
+  # parallelizes the profiled-dominant per-bucket query-quantize (§11) — the one warm-latency lever HNSW's
+  # sequential graph walk can't pull within a segment (§13/§17). SEARCH-time only: the index is unchanged,
+  # so it is NOT in the index cache key and the same index is reused across thread counts. Results are
+  # bit-identical to sequential (deterministic min-position merge). Sweep e.g. (1,2,4,8) for a latency A/B.
+  "lshSearchThreads": (1,),
   # HNSW params (ignored for ivf runs); defaults maxConn=16, beamWidth=100 for good recall.
-  "maxConn": (16,),
-  "beamWidthIndex": (100,),
+  "maxConn": (20,),
+  "beamWidthIndex": (300,),
   "fanout": (100,),
   "numSearchThread": (4,),
   "encoding": ("float32",),
@@ -1999,7 +2073,11 @@ def run_knn_benchmark(checkout, values, log_path):
   if v3:
     dim = 1024
     #doc_vectors = f"/Users/rikhil/Desktop/data/cohere-v3-multilingual-1024d.docs.{LARGE_VEC_DOCS}.vec"
-    doc_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.docs.first1M.vec"
+    #doc_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.docs.first1M.vec"
+    # 20M English Wikipedia vectors (built via --build-large-vecs 20000000, then shuffled to the
+    # 'scattered' distribution by shuffle_vecs.py). ~82GB on disk -> the >RAM regime (findings §13/§20).
+    # ndoc in PARAMS must be <= 20_000_000.
+    doc_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.docs.20M.vec"
     if not os.path.exists(doc_vectors):
       raise RuntimeError(
         f"large doc vectors not found: {doc_vectors}\n"
@@ -2033,6 +2111,13 @@ def run_knn_benchmark(checkout, values, log_path):
 
   cp = benchUtil.classPathToString(benchUtil.getClassPath(checkout) + (f"{constants.BENCH_BASE_DIR}/build",))
   cmd = constants.JAVA_EXE.split(" ") + [
+    # Heap cap: JAVA_EXE is the bare java path (no -Xmx), so without this the index/search JVM ran at
+    # the JVM DEFAULT max heap (~1/4 RAM), silently ignoring KNN_HEAP. At high hashBits the per-segment
+    # centroid arrays (2^hashBits * dim floats) blow past that default -> OOM. KNN_HEAP now applies.
+    # Only -Xmx (no -Xms): the JVM starts with a small heap and grows lazily to the cap, so it COMMITS
+    # only what the live set needs instead of reserving the full cap up front. On a 32GB box -Xms=-Xmx=24g
+    # reserved 24GB resident -> ~8GB swap even though peak USED was ~15-20GB. Lazy commit avoids that.
+    f"-Xmx{constants.KNN_HEAP}",
     "-cp",
     cp,
     "--add-modules",
@@ -2049,6 +2134,23 @@ def run_knn_benchmark(checkout, values, log_path):
 
   if LSH_OFF_HEAP_CENTROIDS:
     cmd += ["-Dlsh.offHeapCentroids=true"]
+
+  if LSH_POSITIONAL_SCAN:
+    cmd += ["-Dlsh.positionalScan=true"]
+
+  if LSH_HNSW_ROUTING:
+    cmd += ["-Dlsh.hnswRouting=true"]
+    if LSH_HNSW_M is not None:
+      cmd += [f"-Dlsh.hnswM={LSH_HNSW_M}"]
+    if LSH_HNSW_BEAM_WIDTH is not None:
+      cmd += [f"-Dlsh.hnswBeamWidth={LSH_HNSW_BEAM_WIDTH}"]
+    if LSH_HNSW_OVERQUERY is not None:
+      cmd += [f"-Dlsh.hnswOverquery={LSH_HNSW_OVERQUERY}"]
+    if LSH_ROUTE_ON_REFERENCE_CENTROIDS:
+      cmd += ["-Dlsh.routeOnReferenceCentroids=true"]
+
+  if LSH_REFERENCE_CENTROIDS_ONLY:
+    cmd += ["-Dlsh.referenceCentroidsOnly=true"]
 
   if DO_PROFILING:
     cmd += [
@@ -2067,9 +2169,12 @@ def run_knn_benchmark(checkout, values, log_path):
   n_query_check = max(values.get("nquery", (1000,)))
   query_start_check = min(values.get("queryStartIndex", (0,)))
   encoding_check = values.get("encoding", ("float32",))[0]
-  knnExactNN.check_vector_overlap(
-    doc_vectors, 0, n_doc_check, query_vectors, query_start_check, n_query_check, dim, encoding_check, check_doc_doc=CHECK_DOC_DOC_DUPLICATES, check_query_query=CHECK_QUERY_QUERY_DUPLICATES
-  )
+  if CHECK_VECTOR_OVERLAP:
+    knnExactNN.check_vector_overlap(
+      doc_vectors, 0, n_doc_check, query_vectors, query_start_check, n_query_check, dim, encoding_check, check_doc_doc=CHECK_DOC_DOC_DUPLICATES, check_query_query=CHECK_QUERY_QUERY_DUPLICATES
+    )
+  else:
+    print("check_vector_overlap: SKIPPED (CHECK_VECTOR_OVERLAP=False); not scanning for doc/query duplicates")
 
   if CHECK_QUERY_DOC_MODEL_CONSISTENCY:
     metric_check = values.get("metric", ("dot_product",))[0]
@@ -2824,6 +2929,13 @@ def build_java_base_cmd(checkout):
   """Build the base Java command (JVM flags + classpath) for KnnGraphTester."""
   cp = benchUtil.classPathToString(benchUtil.getClassPath(checkout) + (f"{constants.BENCH_BASE_DIR}/build",))
   cmd = constants.JAVA_EXE.split(" ") + [
+    # Heap cap: JAVA_EXE is the bare java path (no -Xmx), so without this the index/search JVM ran at
+    # the JVM DEFAULT max heap (~1/4 RAM), silently ignoring KNN_HEAP. At high hashBits the per-segment
+    # centroid arrays (2^hashBits * dim floats) blow past that default -> OOM. KNN_HEAP now applies.
+    # Only -Xmx (no -Xms): the JVM starts with a small heap and grows lazily to the cap, so it COMMITS
+    # only what the live set needs instead of reserving the full cap up front. On a 32GB box -Xms=-Xmx=24g
+    # reserved 24GB resident -> ~8GB swap even though peak USED was ~15-20GB. Lazy commit avoids that.
+    f"-Xmx{constants.KNN_HEAP}",
     "-cp",
     cp,
     "--add-modules",
@@ -2838,6 +2950,20 @@ def build_java_base_cmd(checkout):
     cmd += ["-Dlsh.scanStats=true"]
   if LSH_OFF_HEAP_CENTROIDS:
     cmd += ["-Dlsh.offHeapCentroids=true"]
+  if LSH_POSITIONAL_SCAN:
+    cmd += ["-Dlsh.positionalScan=true"]
+  if LSH_HNSW_ROUTING:
+    cmd += ["-Dlsh.hnswRouting=true"]
+    if LSH_HNSW_M is not None:
+      cmd += [f"-Dlsh.hnswM={LSH_HNSW_M}"]
+    if LSH_HNSW_BEAM_WIDTH is not None:
+      cmd += [f"-Dlsh.hnswBeamWidth={LSH_HNSW_BEAM_WIDTH}"]
+    if LSH_HNSW_OVERQUERY is not None:
+      cmd += [f"-Dlsh.hnswOverquery={LSH_HNSW_OVERQUERY}"]
+    if LSH_ROUTE_ON_REFERENCE_CENTROIDS:
+      cmd += ["-Dlsh.routeOnReferenceCentroids=true"]
+  if LSH_REFERENCE_CENTROIDS_ONLY:
+    cmd += ["-Dlsh.referenceCentroidsOnly=true"]
   cmd += ["knn.KnnGraphTester"]
   return cmd
 

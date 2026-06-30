@@ -249,6 +249,16 @@ public class KnnGraphTester implements FormatterLogger {
   // properties at index time. lshSoarLambda is the orthogonality weight (default 1.0).
   private boolean lshSoar;
   private double lshSoarLambda;
+  // When true, DROP the stored full-precision originals (.vec/.vemf written empty) by passing
+  // -Dlsh.storeRawVectors=false at index time. The raw float32 copy is the dominant merge I/O at >RAM
+  // scale; the concat path doesn't need it. Safe only when rerank is off + queries are unfiltered (the
+  // exact-search fallback needs originals) + CheckIndex is not run. Write-only, persisted per field.
+  private boolean lshNoRaw;
+  // Number of threads the LSH reader uses to scan a single segment's selected buckets per query (1 =
+  // sequential, the default). Set via the lsh.searchThreads system property BEFORE the search phase. This
+  // is a SEARCH-time knob that does not change the index, so (unlike the index-time lsh.* props) it is NOT
+  // part of the index cache key — the same index is reused across thread counts for a clean latency A/B.
+  private int lshSearchThreads;
   // LSH frozen PCA hash basis: subspace dim m (0 = data-independent hash, no PCA). When >0 the harness
   // trains (mu,V) once from a sample of the doc vectors and injects it into the codec (merge-stable).
   private int lshPcaDim;
@@ -316,6 +326,8 @@ public class KnnGraphTester implements FormatterLogger {
     lshSpillBits = 0; // index-time spilling off by default
     lshSoar = false; // SOAR spill selection off by default (plain lowest-|projection| spilling)
     lshSoarLambda = 1.0; // SOAR orthogonality weight (used only when lshSoar && lshSpillBits>0)
+    lshNoRaw = false; // store full-precision originals by default (rerank/exact-fallback/CheckIndex need them)
+    lshSearchThreads = 1; // single-threaded per-segment scan by default (original path)
     overSample = 1f;
     rerank = false;
     rerankQuantizeBits = 32;
@@ -541,6 +553,15 @@ public class KnnGraphTester implements FormatterLogger {
           break;
         case "-lshSoar":
           lshSoar = true;
+          break;
+        case "-lshNoRaw":
+          lshNoRaw = true;
+          break;
+        case "-lshSearchThreads":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-lshSearchThreads requires a following int");
+          }
+          lshSearchThreads = Integer.parseInt(args[++iarg]);
           break;
         case "-lshSoarLambda":
           if (iarg == args.length - 1) {
@@ -823,7 +844,7 @@ public class KnnGraphTester implements FormatterLogger {
                                      parentJoin, filterStrategy, filterSelectivity, randomSeed,
                                      docVectorsPath, numDocs, metric, forceMerge,
                                      ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor,
-                                     lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaDim, lshItq, lshQuantizeBits, lshSpillBits, lshSoar, lshSoarLambda);
+                                     lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaDim, lshItq, lshQuantizeBits, lshSpillBits, lshSoar, lshSoarLambda, lshNoRaw);
     log("index key = %s\n", indexKey);
     
     if (indexPath == null) {
@@ -856,8 +877,21 @@ public class KnnGraphTester implements FormatterLogger {
       reindexReason = null;
     }
 
+    // Per-segment LSH search parallelism (search-time; does NOT affect the index, hence not in the index
+    // key). Set BEFORE any index is opened below, because LSHVectorsReader.SEARCH_THREADS is initialized
+    // from this property when that class is first loaded (which happens on the first index open).
+    if (indexType == IndexType.LSH) {
+      System.setProperty("lsh.searchThreads", Integer.toString(lshSearchThreads));
+      // nprobe is a search-time scan budget (it changes which/how many buckets are selected, never
+      // the on-disk bytes), so it is NOT in the index key and one cached index serves any nprobe. The
+      // reader normally reads the value persisted at write time; this override (read into
+      // LSHVectorsReader.NPROBE_OVERRIDE at class load, like searchThreads) makes the SWEPT value win
+      // so an nprobe sweep reuses one index instead of reindexing per value. Set before first open.
+      System.setProperty("lsh.nprobe", Integer.toString(lshNprobe));
+    }
+
     int segmentCount;
-    
+
     if (reindexReason != null) {
 
       if (explicitIndexPath && reindex == false) {
@@ -885,6 +919,10 @@ public class KnnGraphTester implements FormatterLogger {
         // (if taken) chooses the same spill buckets as flush. No-op unless lshSpillBits>0.
         System.setProperty("lsh.soar", Boolean.toString(lshSoar));
         System.setProperty("lsh.soarLambda", Double.toString(lshSoarLambda));
+        // Whether to persist the full-precision originals (read in LSHVectorsWriter.storeRawVectors()).
+        // false ⇒ empty .vec/.vemf and no raw copy at merge (the dominant >RAM merge cost). Set before
+        // flush AND force-merge so every segment + the merge agree on the on-disk layout.
+        System.setProperty("lsh.storeRawVectors", Boolean.toString(lshNoRaw == false));
       }
 
       // Train the frozen LSH PCA hash basis ONCE (if enabled) before building any segment, so every
@@ -1217,7 +1255,7 @@ public class KnnGraphTester implements FormatterLogger {
                                        int lshHashBits, int lshNumTables, int lshNprobe,
                                        int lshBucketPoolFactor, int lshRerankFactor, int lshPcaDim,
                                        boolean lshItq, int lshQuantizeBits, int lshSpillBits,
-                                       boolean lshSoar, double lshSoarLambda)
+                                       boolean lshSoar, double lshSoarLambda, boolean lshNoRaw)
     throws IOException {
 
     List<String> suffix = new ArrayList<>();
@@ -1259,13 +1297,14 @@ public class KnnGraphTester implements FormatterLogger {
       suffix.add("crf" + ivfCentroidRefineFactor);
       suffix.add("rr" + ivfRerankFactor);
     } else if (indexType == IndexType.LSH) {
-      // lshHashBits changes the on-disk bucketing. nprobe/rerankFactor are search-only but are
-      // PERSISTED in the index meta at write time (the reader is SPI-instantiated with no caller
-      // config), so a cached index bakes them in — include them here so a sweep reindexes per combo.
+      // lshHashBits changes the on-disk bucketing. nprobe is persisted in the index meta at write
+      // time, BUT the reader honors a -Dlsh.nprobe search-time override (set above from lshNprobe), so
+      // it is NOT a write-time-only param — it is OMITTED from the key so an nprobe sweep reuses ONE
+      // cached index instead of reindexing per value. rerankFactor stays in the key: it is persisted
+      // and has no override, so a cached index bakes it in.
       suffix.add("lsh");
       suffix.add(Integer.toString(lshHashBits));
       suffix.add("L" + lshNumTables);
-      suffix.add("np" + lshNprobe);
       suffix.add("bpf" + lshBucketPoolFactor);
       suffix.add("rr" + lshRerankFactor);
       suffix.add("pca" + lshPcaDim);
@@ -1287,6 +1326,19 @@ public class KnnGraphTester implements FormatterLogger {
         if (lshSoar) {
           suffix.add("soar" + lshSoarLambda);
         }
+      }
+      // Dropping the stored originals changes which files exist on disk (empty .vec/.vemf) and disables
+      // rerank/exact-fallback, so a no-raw index must not be reused for a normal run. Omit when off to
+      // keep legacy keys stable.
+      if (lshNoRaw) {
+        suffix.add("noraw");
+      }
+      // referenceCentroidsOnly changes the on-disk format (no TRUE centroids: centroidsLength==0, and
+      // the radius is reference-anchored), so a reference-only index must NOT be reused for a normal
+      // run or vice versa. It is a write-time system property (not a tester arg), so read it here.
+      // Omit when off to keep legacy keys stable.
+      if (Boolean.getBoolean("lsh.referenceCentroidsOnly")) {
+        suffix.add("refc");
       }
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
@@ -1984,6 +2036,11 @@ public class KnnGraphTester implements FormatterLogger {
       // checking low-precision recall
       if (vectorEncoding.equals(VectorEncoding.BYTE)) {
         result = computeExactNNByte(queryPath, queryStartIndex);
+      } else if (exactNNFromDocsFile()) {
+        // The index does NOT store the full-precision originals (LSH -lshNoRaw), so the index-based
+        // brute force would read an empty .vec and hang. Compute the ground truth directly from the
+        // external docs file instead — its ids match the stored ID_FIELD (id == docs-file ordinal).
+        result = computeExactNNFromDocsFile(docPath, queryPath, queryStartIndex);
       } else {
         result = computeExactNN(queryPath, queryStartIndex);
       }
@@ -2364,6 +2421,238 @@ public class KnnGraphTester implements FormatterLogger {
         log("\n");
         return new ExactNNResult(result, scores);
       }
+    }
+  }
+
+  /**
+   * Whether the exact-NN ground truth must be computed from the external docs file rather than the
+   * index. True when the LSH codec was built with raw-vector storage dropped (-lshNoRaw): the index's
+   * .vec is empty, so the index-based brute force would read no vectors (and hang). The docs file always
+   * holds the real float32 vectors, and the stored ID_FIELD equals each vector's ordinal in that file
+   * (see IndexerThread), so truth computed here uses the same id space as search results. Restricted to
+   * the unfiltered, non-parentJoin, float KNN case — filters/joins need the index structures.
+   */
+  private boolean exactNNFromDocsFile() {
+    return lshNoRaw
+        && indexType == IndexType.LSH
+        && parentJoin == false
+        && filterStrategy == null
+        && searchType == SearchType.KNN
+        && vectorEncoding == VectorEncoding.FLOAT32;
+  }
+
+  /**
+   * Computes exact top-K nearest neighbors by brute force directly over the external docs file, without
+   * opening the index. Used when the index does not store the originals (-lshNoRaw). Streams the docs
+   * file in contiguous ordinal ranges across threads (each range read sequentially), scoring every doc
+   * against all queries with the same {@link VectorSimilarityFunction} the indexed search uses, so the
+   * resulting truth set is identical to the index-based path. Result ids are docs-file ordinals, which
+   * match the stored ID_FIELD recall compares against.
+   */
+  private ExactNNResult computeExactNNFromDocsFile(Path docPath, Path queryPath, int queryStartIndex)
+      throws IOException, InterruptedException {
+    log("computing true nearest neighbors of %d target vectors from docs file \"%s\" (index has no raw vectors)\n",
+        numQueryVectors, docPath);
+
+    // Load all queries into RAM (numQueryVectors * dim floats -- tiny).
+    float[][] queries = new float[numQueryVectors][];
+    try (FileChannel qIn = getVectorFileChannel(queryPath, dim, vectorEncoding, !quiet)) {
+      VectorReader queryReader = (VectorReader) VectorReader.create(qIn, dim, vectorEncoding, queryStartIndex);
+      for (int i = 0; i < numQueryVectors; i++) {
+        queries[i] = queryReader.next().clone();
+      }
+    }
+
+    // COSINE indexes vectors normalized; VectorSimilarityFunction.COSINE.compare handles normalization
+    // internally for both operands, so scoring the raw doc/query vectors here matches the index.
+    VectorSimilarityFunction sim = similarityFunction;
+
+    // Partition the numDocs docs into contiguous ordinal ranges, one task per range. Each task opens its
+    // own channel, seeks to its first ordinal, and reads sequentially -- so the whole file is streamed
+    // once with good locality, regardless of thread count.
+    int coreCount = Runtime.getRuntime().availableProcessors();
+    int poolThreadCount = Math.max(1, coreCount / 2);
+    int taskCount = Math.min(poolThreadCount * 4, numDocs); // a few chunks per thread for load balance
+    if (taskCount < 1) {
+      taskCount = 1;
+    }
+    int perChunk = (numDocs + taskCount - 1) / taskCount;
+    log("using %d threads (%d chunks of ~%d docs) to compute exact NN from docs file\n",
+        poolThreadCount, taskCount, perChunk);
+
+    AtomicInteger completedCount = new AtomicInteger(0);
+    List<Callable<Void>> tasks = new ArrayList<>();
+    List<DocsFileNNTask> nnTasks = new ArrayList<>();
+    for (int c = 0; c < taskCount; c++) {
+      int startOrd = c * perChunk;
+      if (startOrd >= numDocs) {
+        break;
+      }
+      int endOrd = Math.min(startOrd + perChunk, numDocs);
+      // Docs are indexed starting at ordinal 0 of the docs file (KnnIndexer docsStartIndex=0), and the
+      // stored id == that ordinal, so the brute force must read from doc ordinal 0 (NOT queryStartIndex,
+      // which only offsets the QUERY file).
+      DocsFileNNTask task =
+          new DocsFileNNTask(docPath, queries, sim, startOrd, endOrd, /* docVectorStartIndex= */ 0, completedCount);
+      nnTasks.add(task);
+      tasks.add(task);
+    }
+
+    runTasksWithProgress(tasks, completedCount, this);
+
+    // Merge each chunk's per-query top-K heaps into a single global top-K per query.
+    int[][] result = new int[numQueryVectors][];
+    float[][] scores = new float[numQueryVectors][];
+    for (int q = 0; q < numQueryVectors; q++) {
+      BoundedScoreHeap merged = new BoundedScoreHeap(topK);
+      for (DocsFileNNTask task : nnTasks) {
+        BoundedScoreHeap h = task.heaps[q];
+        for (int i = 0; i < h.size; i++) {
+          merged.offer(h.ids[i], h.scores[i]);
+        }
+      }
+      merged.toSortedDescending(); // best-first, matching TopDocs order
+      result[q] = Arrays.copyOf(merged.ids, merged.size);
+      scores[q] = Arrays.copyOf(merged.scores, merged.size);
+    }
+    log("\n");
+    return new ExactNNResult(result, scores);
+  }
+
+  /**
+   * A fixed-capacity max-K min-heap of (id, score) keeping the K HIGHEST scores seen (min-heap so the
+   * smallest kept score is at the root and is evicted first). No boxing.
+   */
+  static final class BoundedScoreHeap {
+    final int capacity;
+    final int[] ids;
+    final float[] scores;
+    int size;
+
+    BoundedScoreHeap(int capacity) {
+      this.capacity = capacity;
+      this.ids = new int[capacity];
+      this.scores = new float[capacity];
+      this.size = 0;
+    }
+
+    void offer(int id, float score) {
+      if (size < capacity) {
+        ids[size] = id;
+        scores[size] = score;
+        size++;
+        siftUp(size - 1);
+      } else if (score > scores[0]) {
+        ids[0] = id;
+        scores[0] = score;
+        siftDown(0);
+      }
+    }
+
+    private void siftUp(int i) {
+      while (i > 0) {
+        int parent = (i - 1) >>> 1;
+        if (scores[parent] <= scores[i]) {
+          break;
+        }
+        swap(i, parent);
+        i = parent;
+      }
+    }
+
+    private void siftDown(int i) {
+      while (true) {
+        int l = 2 * i + 1, r = 2 * i + 2, smallest = i;
+        if (l < size && scores[l] < scores[smallest]) {
+          smallest = l;
+        }
+        if (r < size && scores[r] < scores[smallest]) {
+          smallest = r;
+        }
+        if (smallest == i) {
+          break;
+        }
+        swap(i, smallest);
+        i = smallest;
+      }
+    }
+
+    private void swap(int a, int b) {
+      int ti = ids[a];
+      ids[a] = ids[b];
+      ids[b] = ti;
+      float ts = scores[a];
+      scores[a] = scores[b];
+      scores[b] = ts;
+    }
+
+    /** Sorts the kept entries in DESCENDING score order in place (heap is destroyed). */
+    void toSortedDescending() {
+      // simple insertion sort over <= capacity entries (K is small)
+      for (int i = 1; i < size; i++) {
+        int id = ids[i];
+        float sc = scores[i];
+        int j = i - 1;
+        while (j >= 0 && scores[j] < sc) {
+          ids[j + 1] = ids[j];
+          scores[j + 1] = scores[j];
+          j--;
+        }
+        ids[j + 1] = id;
+        scores[j + 1] = sc;
+      }
+    }
+  }
+
+  /** Brute-forces a contiguous range [startOrd, endOrd) of the docs file against all queries. */
+  class DocsFileNNTask implements Callable<Void> {
+    private final Path docPath;
+    private final float[][] queries;
+    private final VectorSimilarityFunction sim;
+    private final int startOrd;
+    private final int endOrd;
+    private final int docVectorStartIndex;
+    private final AtomicInteger completedCount;
+    final BoundedScoreHeap[] heaps;
+
+    DocsFileNNTask(Path docPath, float[][] queries, VectorSimilarityFunction sim, int startOrd,
+                   int endOrd, int docVectorStartIndex, AtomicInteger completedCount) {
+      this.docPath = docPath;
+      this.queries = queries;
+      this.sim = sim;
+      this.startOrd = startOrd;
+      this.endOrd = endOrd;
+      this.docVectorStartIndex = docVectorStartIndex;
+      this.completedCount = completedCount;
+      this.heaps = new BoundedScoreHeap[queries.length];
+      for (int q = 0; q < queries.length; q++) {
+        heaps[q] = new BoundedScoreHeap(topK);
+      }
+    }
+
+    @Override
+    public Void call() {
+      try (FileChannel in = getVectorFileChannel(docPath, dim, vectorEncoding, false)) {
+        // Seek to this chunk's first doc vector (docVectorStartIndex offsets the whole doc set, then our
+        // chunk start within it), then read sequentially.
+        VectorReader reader = VectorReader.create(in, dim, vectorEncoding, docVectorStartIndex + startOrd);
+        int numQueries = queries.length;
+        for (int ord = startOrd; ord < endOrd; ord++) {
+          float[] doc = reader.next(); // reused buffer; consume immediately below
+          for (int q = 0; q < numQueries; q++) {
+            float score = sim.compare(queries[q], doc);
+            heaps[q].offer(ord, score);
+          }
+        }
+        completedCount.incrementAndGet();
+      } catch (IOException e) {
+        log("Exception " + e + "\n");
+        throw new RuntimeException(e);
+      } catch (Throwable t) {
+        log("Throwable " + t + "\n");
+        throw t;
+      }
+      return null;
     }
   }
 

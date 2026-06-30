@@ -18,7 +18,7 @@ PYTHON=python3
 RUNS="${1:-1}"
 # JVM heap cap for the search/index JVM (-Xms/-Xmx), read by constants.py. Override per-run:
 #   KNN_HEAP=1g ./run_knn_bench.sh   (cap below index size to force the disk/off-heap path -- findings §20)
-KNN_HEAP="${KNN_HEAP:-1g}"
+KNN_HEAP="${KNN_HEAP:-24g}"
 
 export JAVA_HOME
 export PATH="$JAVA_HOME/bin:$PATH"
@@ -41,9 +41,22 @@ cd "$LUCENEUTIL_DIR"
 # empty dir satisfies a knnPerfTest.py preflight classpath check (real classes live in ./build)
 mkdir -p "$LUCENEUTIL_DIR/src/main/build/classes/java/main"
 
-# --- 3. clear the knn-reuse cache --------------------------------------------
-echo "=== [3/4] clearing knn-reuse cache ==="
-rm -rf "$LUCENEUTIL_DIR/knn-reuse"
+# --- 3. knn-reuse cache -------------------------------------------------------
+# Indexes are cached under knn-reuse/indices keyed by ALL index-affecting params (hashBits, nprobe-is-
+# NOT-in-key since it is search-time, spillBits, pca, itq, quantize, ...). Search-only params (nprobe,
+# searchThreads, overquery) are not in the key, so a matching index is correctly reused across those --
+# letting you iterate on search params WITHOUT rebuilding the (20M) index each run.
+#
+# DEFAULT: keep the cache (fast search-param iteration).
+# CLEAR IT (KNN_CLEAR_CACHE=1) whenever you changed the CODEC / on-disk format -- the cache key does not
+# capture jar changes, so a stale index would silently give wrong/0.0 recall. Rule of thumb: cleared
+# any LSHVectors*.java or rebuilt the format => set KNN_CLEAR_CACHE=1 for that run.
+if [[ "${KNN_CLEAR_CACHE:-1}" == "1" ]]; then
+  echo "=== [3/4] clearing knn-reuse cache (KNN_CLEAR_CACHE=1) ==="
+  rm -rf "$LUCENEUTIL_DIR/knn-reuse"
+else
+  echo "=== [3/4] keeping knn-reuse cache (set KNN_CLEAR_CACHE=1 to clear after codec/format changes) ==="
+fi
 
 # --- 4. run the benchmark with python 3.11 ------------------------------------
 # NOTE: do NOT use './gradlew runKnnPerfTest' -- it hardcodes the system python3 (3.7, too old).

@@ -64,7 +64,12 @@ public class KnnIndexer implements FormatterLogger {
 
   // use smaller ram buffer so we get to merging sooner, making better use of
   // many cores
-  private static final double WRITER_BUFFER_MB = 128;
+  // Lowered 128->32 for the high-hashBits (18b) / 20M build: large flushes pushed the live set to the
+  // heap ceiling (~24g) and the JVM thrashed in back-to-back GCs (sawtooth indexing: stall, then burst).
+  // Smaller flushes shrink the per-segment live set so GC has headroom; the extra (cheap concat-path)
+  // merges are absorbed by the single-table merge. Raise back toward 128 for low-hashBits builds where
+  // the per-segment centroid arrays are small and bigger buffers index faster.
+  private static final double WRITER_BUFFER_MB = 32;
 
   private final Path docsPath;
   private final Path indexPath;

@@ -470,51 +470,111 @@ def _extract_top_k(scores, top_k):
   return ids, result_scores
 
 
+# Memory budget for the per-tile score matrix (queries x doc-block). Bounds RAM independent of corpus
+# size; the matmul streams under it. ~2 GiB of float32 scores.
+_SCORE_TILE_BYTES = 2 * 1024**3
+
+
+def _merge_block_topk(best_ids, best_scores, block_scores, block_offset, top_k):
+  """Fold one doc block's similarity scores into the running per-query top-k (higher = better).
+
+  block_scores: (q, bsize) float32 similarities for one doc block (global doc id = block_offset + col).
+  best_ids/best_scores: (q, <=top_k) running top-k, or (None, None) on the first block.
+  Returns updated (best_ids, best_scores), each (q, <=top_k), unsorted.
+  """
+  bsize = block_scores.shape[1]
+  kk = min(top_k, bsize)
+  # This block's own top-kk per query (argpartition is O(bsize), no full sort).
+  part = np.argpartition(block_scores, bsize - kk, axis=1)[:, bsize - kk:]
+  blk_ids = (part + block_offset).astype(np.int32)
+  blk_scores = np.take_along_axis(block_scores, part, axis=1)
+
+  if best_ids is None:
+    cand_ids, cand_scores = blk_ids, blk_scores
+  else:
+    cand_ids = np.concatenate([best_ids, blk_ids], axis=1)
+    cand_scores = np.concatenate([best_scores, blk_scores], axis=1)
+
+  width = cand_scores.shape[1]
+  if width <= top_k:
+    return cand_ids, cand_scores
+  keep = np.argpartition(cand_scores, width - top_k, axis=1)[:, width - top_k:]
+  return np.take_along_axis(cand_ids, keep, axis=1), np.take_along_axis(cand_scores, keep, axis=1)
+
+
 def compute_exact_nn(doc_vectors_path, doc_dim, num_docs, query_vectors, metric, top_k):
-  """Compute exact nearest neighbors using numpy.
+  """Compute exact nearest neighbors using numpy, streaming the doc matrix ONCE.
 
-  Uses multi-threaded BLAS for the heavy matmul (all cores via OpenBLAS/MKL),
-  processing query chunks sequentially.  This is faster than multiprocessing
-  because a single process shares L3 cache across BLAS threads, whereas
-  forked workers each re-read the full doc matrix from RAM.
+  The doc matrix is the large (often >RAM) operand; queries are small. So we iterate DOC BLOCKS in the
+  outer loop -- materializing each block from the memmap exactly once -- and tile QUERIES in the inner
+  loop against the in-RAM block, maintaining a running per-query top-k. This reads the doc file once
+  total (sequential), regardless of query count. (The previous version chunked queries and re-scanned
+  the whole doc matrix per chunk -> ceil(nquery/256) full passes over the file, i.e. tens of TB of disk
+  reads at 20M docs -- the source of the hang.)
 
-  returns (ids, scores) each of shape (num_queries, top_k).
-  scores match lucene's VectorSimilarityFunction encoding.
+  All lucene similarity transforms are monotonic, so we keep top-k by the transformed similarity
+  directly (higher = better for dot_product/cosine/euclidean/mip).
+
+  returns (ids, scores) each of shape (num_queries, top_k), scores in lucene's similarity encoding,
+  sorted descending by score per query.
   """
   num_queries = query_vectors.shape[0]
-  result_ids = np.empty((num_queries, top_k), dtype=np.int32)
-  result_scores = np.empty((num_queries, top_k), dtype=np.float32)
+  q = np.ascontiguousarray(query_vectors, dtype=np.float32)
 
-  # chunk queries so we don't allocate a huge (num_queries, num_docs) score matrix
-  chunk_size = max(1, min(256, num_queries))
-  num_chunks = (num_queries + chunk_size - 1) // chunk_size
-
-  # mmap doc vectors (BLAS threads share the mapping within this process)
+  # mmap doc vectors (read-once, sequential block materialization below).
   doc_vectors = np.memmap(doc_vectors_path, dtype="<f4", mode="r", shape=(num_docs, doc_dim))
 
-  print(f"  {num_chunks} chunks of {chunk_size} queries, multi-threaded BLAS")
+  # Pick a doc block size (rows read into RAM per outer step) and a query tile so the score matrix
+  # (q_tile x doc_block) stays within the budget. Block also bounded so the materialized block (rows*dim)
+  # is a reasonable ~1 GiB.
+  doc_block_rows = max(1, min(num_docs, (1024**3) // (doc_dim * 4)))
+  q_tile = max(1, min(num_queries, _SCORE_TILE_BYTES // (doc_block_rows * 4)))
+
+  num_blocks = (num_docs + doc_block_rows - 1) // doc_block_rows
+  print(
+    f"  streaming {num_docs:,} docs in {num_blocks} block(s) of {doc_block_rows:,} rows, "
+    f"query tile {q_tile} of {num_queries} (single pass over doc file)"
+  )
+
+  best_ids = [None] * ((num_queries + q_tile - 1) // q_tile)
+  best_scores = [None] * len(best_ids)
 
   start_sec = time.monotonic()
   next_report_sec = start_sec
-  completed_queries = 0
+  docs_done = 0
 
-  for chunk_start in range(0, num_queries, chunk_size):
-    chunk_end = min(chunk_start + chunk_size, num_queries)
-    query_chunk = query_vectors[chunk_start:chunk_end]
+  for block_offset in range(0, num_docs, doc_block_rows):
+    block_end = min(block_offset + doc_block_rows, num_docs)
+    # Materialize this block once (the single disk read of these rows); np.asarray copies out of mmap.
+    block = np.asarray(doc_vectors[block_offset:block_end], dtype=np.float32)
 
-    scores = _compute_scores_batch(query_chunk, doc_vectors, metric).astype(np.float32)
-    chunk_ids, chunk_scores = _extract_top_k(scores, top_k)
+    for ti, q_start in enumerate(range(0, num_queries, q_tile)):
+      q_end = min(q_start + q_tile, num_queries)
+      scores = _compute_scores_batch(q[q_start:q_end], block, metric).astype(np.float32, copy=False)
+      best_ids[ti], best_scores[ti] = _merge_block_topk(
+        best_ids[ti], best_scores[ti], scores, block_offset, top_k
+      )
 
-    result_ids[chunk_start:chunk_end] = chunk_ids
-    result_scores[chunk_start:chunk_end] = chunk_scores
-    completed_queries += chunk_end - chunk_start
-
+    docs_done = block_end
     now_sec = time.monotonic()
-    if now_sec >= next_report_sec or completed_queries == num_queries:
-      elapsed_sec = now_sec - start_sec
-      pct = 100.0 * completed_queries / num_queries
-      print(f"  {elapsed_sec:6.1f} s: {pct:5.1f} % ({completed_queries:5d} / {num_queries}) vectors")
+    if now_sec >= next_report_sec or docs_done == num_docs:
+      pct = 100.0 * docs_done / num_docs
+      print(f"  {now_sec - start_sec:6.1f} s: {pct:5.1f} % ({docs_done:,} / {num_docs:,}) docs scanned")
       next_report_sec = now_sec + 5.0
+
+  # Assemble + sort each query's final top-k descending by score (stable secondary on id for
+  # deterministic tie-breaking).
+  result_ids = np.empty((num_queries, top_k), dtype=np.int32)
+  result_scores = np.empty((num_queries, top_k), dtype=np.float32)
+  for ti, q_start in enumerate(range(0, num_queries, q_tile)):
+    q_end = min(q_start + q_tile, num_queries)
+    ids_tile = best_ids[ti]
+    scores_tile = best_scores[ti]
+    # descending by score; numpy sorts ascending, so sort on (-score, id) via lexsort then reverse not
+    # needed -- use argsort on negative score with id as tiebreak.
+    order = np.lexsort((ids_tile, -scores_tile), axis=1)
+    result_ids[q_start:q_end] = np.take_along_axis(ids_tile, order, axis=1)[:, :top_k]
+    result_scores[q_start:q_end] = np.take_along_axis(scores_tile, order, axis=1)[:, :top_k]
 
   return result_ids, result_scores
 
