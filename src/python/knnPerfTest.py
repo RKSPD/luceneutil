@@ -101,6 +101,132 @@ LSH_ROUTE_ON_REFERENCE_CENTROIDS = False
 # vs member mean) — small at high hashBits (narrow wedges), larger at low bits. WRITE-TIME: changes the
 # on-disk format (centroidsLength==0), so it IS effectively in the index and a sweep reindexes per value.
 LSH_REFERENCE_CENTROIDS_ONLY = True
+# IVF coarse-routing A/B knobs (search-time, reader-only — reused on the SAME cached index, no reindex).
+#   IVF_CENTROID_HNSW: False => -Divf.centroidHnsw=false, forcing the EXACT linear coarse scan (rank all
+#     nlist centroids on the full dim). This is the routing-quality ceiling: if recall at fixed nprobe
+#     jumps vs the graph, the graph router is the bottleneck; if it doesn't, coarse routing is already
+#     tight and recall loss is elsewhere (frozen centroids / spill=0).
+#   IVF_REFINE_FACTOR: None => use the persisted value; an int => -Divf.refineFactor=N, so the graph
+#     over-collects N*nprobe centroids and re-ranks them on the FULL dim before probing. Larger N drives
+#     the graph's probe set toward the exact-scan probe set at a fraction of exact-scan cost.
+IVF_CENTROID_HNSW = None      # None => leave default (graph on); False => exact linear coarse scan
+IVF_REFINE_FACTOR = None      # None => persisted; e.g. 4 => -Divf.refineFactor=4
+# IVF_RERANK_FACTOR: None => persisted; an int => -Divf.rerankFactor=N. Cranked high (e.g. 400) every
+# visited doc gets exact float32 rerank, so recall becomes a PURE COVERAGE measurement (partition
+# quality) with quantization misranking removed. Search-time, reader-only — same cached index.
+IVF_RERANK_FACTOR = 1
+# IVF_ADAPTIVE_NPROBE_MARGIN: None/>=1.0 => disabled (always probe full nprobe). A float in (0,1) =>
+# -Divf.adaptiveNprobeMargin=M: probe UP TO nprobe cells but stop early, keeping cell j only while its
+# query→centroid squared distance dj <= d0/M (d0 = nearest cell). M→1 keeps ~all cells; smaller prunes
+# harder (lower avg latency, risks recall). A floor of 8 cells guards recall. SEARCH-TIME, reader-only —
+# same cached index, so A/B it without reindexing. Sweep e.g. 0.5/0.7/0.85. See findings §19.
+IVF_ADAPTIVE_NPROBE_MARGIN = None
+# LLOYD_BEAM_FACTOR: lloyd_ivf only. Widens the centroid-graph beam to efSearch=ceil(nprobe*factor)
+# while still scanning only the top nprobe cells -> better cell selection at ~free coarse-select cost
+# (select is cheap vs the posting scan). None/1.0 => beam == nprobe (old behavior). Search-time only
+# (-Dlloyd.beamFactor), so a factor sweep reuses ONE cached index. Try 1.0/1.5/2.0/3.0.
+LLOYD_BEAM_FACTOR = float(os.environ["LLOYD_BEAM_FACTOR"]) if os.environ.get("LLOYD_BEAM_FACTOR") else None
+# LLOYD_CEIL_AUDIT=1 => -Dlloyd.ceilAudit=true: per-query, the reader exact-scans its own code table
+# for the achievable top-k, then reports how the NN docs' primary cells scatter across the centroid-
+# distance frontier (meanDistinctNNCells, meanMaxNNCellRank). Diagnostic only; slow (full scan/query).
+LLOYD_CEIL_AUDIT = os.environ.get("LLOYD_CEIL_AUDIT") == "1"
+# LLOYD_CEIL_DIR=1 => -Dlloyd.ceilDir=true: adds the EXACT directional-oracle ranking to the ceiling
+# audit (needs LLOYD_CEIL_AUDIT=1). RAM-heavy (retains count*dim float residuals). Diagnostic only.
+LLOYD_CEIL_DIR = os.environ.get("LLOYD_CEIL_DIR") == "1"
+# LLOYD_CEIL_ANISO=1 => -Dlloyd.ceilAniso=true: anisotropic-reassignment audit (§10c). Needs
+# LLOYD_CEIL_AUDIT=1. Cheap-ish (full centroids, no residual RAM). Sweeps eta internally.
+LLOYD_CEIL_ANISO = os.environ.get("LLOYD_CEIL_ANISO") == "1"
+# LLOYD_CEIL_SUB=1 => -Dlloyd.ceilSub=true: 2-level sub-centroid ceiling probe (§10e). Needs
+# LLOYD_CEIL_AUDIT=1. Builds K sub-centroids/cell, ranks by min query->subcentroid dist. RAM-heavy.
+LLOYD_CEIL_SUB = os.environ.get("LLOYD_CEIL_SUB") == "1"
+# LLOYD_CEIL_SEP=1 => -Dlloyd.ceilSep=true: separability probe (§10f). Needs LLOYD_CEIL_AUDIT=1.
+LLOYD_CEIL_SEP = os.environ.get("LLOYD_CEIL_SEP") == "1"
+# LLOYD_CEIL_ONLINE=1 => -Dlloyd.ceilOnline=true: online-steering probe (§10h). Needs LLOYD_CEIL_AUDIT=1.
+LLOYD_CEIL_ONLINE = os.environ.get("LLOYD_CEIL_ONLINE") == "1"
+# LLOYD_CEIL_ADJ=1 => -Dlloyd.ceilAdj=true: graph-adjacency probe (§10i). Needs LLOYD_CEIL_AUDIT=1.
+LLOYD_CEIL_ADJ = os.environ.get("LLOYD_CEIL_ADJ") == "1"
+# LLOYD_CEIL_SELEXP=1 => -Dlloyd.ceilSelExp=true: selective-expansion audit (§10j). Needs LLOYD_CEIL_AUDIT=1.
+LLOYD_CEIL_SELEXP = os.environ.get("LLOYD_CEIL_SELEXP") == "1"
+# LLOYD_CEIL_BRUTE=1 => -Dlloyd.ceilBrute=true: full-corpus 1-bit sign scan → int8 rerank recall (§10L). Needs LLOYD_CEIL_AUDIT=1.
+LLOYD_CEIL_BRUTE = os.environ.get("LLOYD_CEIL_BRUTE") == "1"
+# LLOYD_CEIL_SPILL=1 => -Dlloyd.ceilSpill=true: §11 spill audit — credit each NN with the NEAREST-ranked
+# cell it is SPILLED into (min rank over its posting lists) vs the primary-cell-only baseline. The gap
+# shows how far spill pulls the NN-cell frontier forward. Needs LLOYD_CEIL_AUDIT=1, ivfSpillBits>0, and
+# ORD-order (IVF_CELL_ORDER=0 — the audit needs ord==doc). No-op under cell-order.
+LLOYD_CEIL_SPILL = os.environ.get("LLOYD_CEIL_SPILL") == "1"
+# GCUT_TREE_ROUTE_DIMS=<n> => -Dgcut.treeRouteDims=<n>: WRITE-time. Persist the gcut cut tree with
+# axis/center rows truncated to the leading n (post-rotation) dims, enabling the partition-consistent
+# margin router. 0/unset disables (routes by nearest-centroid HNSW as before). In the index → clear
+# cache when changed. Use the full dim for an exact tree.
+GCUT_TREE_ROUTE_DIMS = int(os.environ["GCUT_TREE_ROUTE_DIMS"]) if os.environ.get("GCUT_TREE_ROUTE_DIMS") else None
+# GCUT_TREE_ROUTE=1 => -Dgcut.treeRoute=true: SEARCH-time. Route by descending the persisted cut tree
+# (best-first by boundary margin) instead of nearest-centroid. No-op unless the segment carries a tree
+# (GCUT_TREE_ROUTE_DIMS was set at index time). Reuses one cached index for the A-B vs nearest-centroid.
+GCUT_TREE_ROUTE = os.environ.get("GCUT_TREE_ROUTE") == "1"
+# LLOYD_BRUTE_SEARCH=1 => -Dlloyd.bruteSearch=true + -Dlloyd.ceilBruteDims=1024: the real two-phase
+# search path (sign-1024 Hamming shortlist → int8 rerank). Drops IVF routing as a recall mechanism.
+LLOYD_BRUTE_SEARCH = os.environ.get("LLOYD_BRUTE_SEARCH") == "1"
+# LLOYD_SKETCH_SCAN=1 => -Dlloyd.sketchScan=true + sign-1024: routed sketch scan (§10M). Keeps HNSW
+# routing, scans selected cells with 1-bit Hamming → int8 rerank. RAM-friendly (sublinear). Pair w/ high nprobe.
+# DEFAULT ON: the §10N shippable operating point (cell-order 5-bit sketch-scan, 0.944 / 12.3 ms). Set
+# LLOYD_SKETCH_SCAN=0 to force it off.
+LLOYD_SKETCH_SCAN = os.environ.get("LLOYD_SKETCH_SCAN", "1") == "1"
+# IVF_QUANT_BITS: rerank code bit-depth (default 8). 5 => 5-bit codes (§10M, 640B/doc). Write+read side.
+# DEFAULT 5 for the §10N operating point (5-bit bit-plane codes). Override e.g. IVF_QUANT_BITS=8 for int8.
+IVF_QUANT_BITS = os.environ.get("IVF_QUANT_BITS", "5")
+# IVF_BEAM_SPILL=1 => -Divf.beamSpill=true: ADAPTIVE HNSW-beam spilling (§11). When ivfSpillBits>0 the
+# writer routes each doc through the centroid HNSW beam for its 1+spillBits nearest cells, then keeps only
+# the leading cells within IVF_SPILL_MARGIN× the nearest cell's distance — boundary docs spill, interior
+# docs stay single-cell. Coexists with cell-order (spilled records duplicated per cell block). WRITE-TIME
+# (in the index) → reindex per value. Requires ivfSpillBits>0 in PARAMS to do anything.
+IVF_BEAM_SPILL = os.environ.get("IVF_BEAM_SPILL") == "1"
+# IVF_SPILL_MARGIN: adaptive-spill distance ratio (default 1.30, matches the codec default). Keep cell j
+# while dist_j <= margin*dist_0. Larger => more spill (higher recall, bigger index). WRITE-TIME → reindex.
+IVF_SPILL_MARGIN = os.environ.get("IVF_SPILL_MARGIN")
+# LLOYD_RERANK_BITS: simulate B-bit rerank in sketch-scan (§10M gate). Default 8 (real int8). 4 => 4-bit.
+LLOYD_RERANK_BITS = os.environ.get("LLOYD_RERANK_BITS")
+# IVF_ENABLE_COPY_MERGE: the codec default is now the warm-start re-cluster merge path (seed centroids
+# from the largest donor segment + GRAPH_ROUTE_ITERS graph-routed Lloyd passes over ALL merged docs +
+# requantize) — centroids adapt to the merged distribution, best recall. Set True => -Divf.enableCopyMerge
+# =true to opt INTO the frozen-centroid copy-merge fast path (faster merge, worse recall) for a merge-speed
+# A/B. WRITE-TIME: reindexes. Leave False for the recall hot path.
+IVF_ENABLE_COPY_MERGE = False
+# IVF_EXACT_ASSIGN: True => -Divf.exactAssign=true, writer places each doc via an exact full-dim
+# nearest-centroid scan (matches reader cell selection) instead of the lossy efSearch=8 graph beam.
+# WRITE-TIME: reindexes. Tests whether coarse-partition recall loss is assignment fidelity.
+IVF_EXACT_ASSIGN = False
+# IVF_WORK_DIMS: None => no truncation (full dim). An int => -Divf.workDims=N: after the full-dim
+# Hadamard rotation, truncate to N leading dims as the WORKING representation for centroids/codes/
+# routing/ADC (≈dim/N cheaper scan/route/quantize + smaller postings); full dim kept only for rotation
+# + exact rerank. JL-safe. WRITE-TIME: reindexes. Sweep 64/128/256/512 for the recall/latency frontier.
+IVF_WORK_DIMS = None
+# IVF_GRAPH_ROUTE_ITERS: None => leave default (2); an int => -Divf.graphRouteIters=N. This is the
+# "Lloyd iters on merge/flush" lever: each pass builds an HNSW over the current centroids, graph-routes
+# every doc (~log(nlist) comparisons), and recomputes centroids. N=1 = single online-k-means step (seed
+# + one refine); N=2 (default) converges incremental centroids; higher N = more centroid refinement per
+# flush/merge at O(N·count·log(nlist)·dim). WRITE-TIME: reindexes. A/B whether extra merge-time Lloyd
+# refinement actually buys recall (findings: more Lloyd iters made high-nlist recall WORSE — the gap is
+# writer assignment vs reader selection fidelity, not centroid position). Set to 1 to test cheaper merge.
+IVF_GRAPH_ROUTE_ITERS = None
+# IVF_ANISO_ETA: ScaNN anisotropic k-means ratio eta=h_par/h_orth (write-time, IN the index -> reindex).
+# None/1.0 => today's spherical Lloyd. >1 => anisotropic assign + WLS centroid update, no renorm.
+IVF_ANISO_ETA = float(os.environ["IVF_ANISO_ETA"]) if os.environ.get("IVF_ANISO_ETA") else None
+# IVF_SHARED_CODES: False => legacy per-record postings (self-contained centroid-relative OSQ records).
+# True => -Divf.sharedCodes=true: each doc's OSQ code is stored ONCE in a per-ord code table (quantized
+# against a single GLOBAL reference = the rotated field mean, NOT the per-cell centroid), and postings
+# become 4-byte ord references. Decouples index size from spillBits (a spilled doc replicates 4 bytes,
+# not a ~1KB code). Cost: coarser per-cell quantization (§16b says recall-neutral WITH rerank; without
+# rerank the coarse scan is worse). WRITE-TIME: reindexes. OSQ only (ignored for PQ/Block).
+IVF_SHARED_CODES = True
+# IVF_DROP_RAW_VECTORS: False => codec default (store the original full-precision vectors in .vec/.vemf,
+# used for exact rerank + merge re-clustering on true originals). True => -Divf.dropRawVectors=true: do
+# NOT persist the full-precision vectors. Shrinks the index by the raw float32 footprint (dim*4 bytes/doc)
+# but disables exact rerank (rerankFactor is forced to 1) and forces merges to re-cluster on reconstructed
+# (quantized) vectors instead of true originals. SAFE ONLY when rerank is off (IVF_RERANK_FACTOR=1), since
+# no reranking is done on the IVF codec. WRITE-TIME: reindexes.
+IVF_DROP_RAW_VECTORS = False
+# GCUT partitioner knobs are swept via the PARAMS dict (gcutMode/gcutSplitBy/gcutBalancePenalty/
+# gcutAxes), passed as CLI args to KnnGraphTester, which sets the corresponding -Dgcut.* sysprops.
 # Number of concurrent indexing threads passed to KnnGraphTester (-numIndexThreads). Affects build
 # wall-clock only; with -forceMerge the final single-segment index is concurrency-independent. This box
 # has 12 cores. Used at both the search-and-stats and the search-only command builders below.
@@ -299,11 +425,63 @@ NOISY = True
 # test parameters. This script will run KnnGraphTester on every combination of these parameters
 PARAMS = {
   "ndoc": (1_000_000,),
-  "indexType": ("lsh",),
+  "indexType": ("lloyd_ivf",),
   # IVF params (ignored for hnsw runs)
-  "ivfNlist": (1024,),
-  "ivfNprobe": (64,),
-  "ivfClusterTrainDims": (64,),
+  # Target ~50 docs/Voronoi cell: nlist = ndoc / 50 = 1_000_000 / 50 = 20_000.
+  # nlist sweep: smaller cells (higher nlist) should reach recall=0.95 while visiting FEWER total docs
+  # (~docs/cell * nprobe), even though they need more probes. nlist is in the index key → one reindex
+  # per value; nprobe is a search-time override so each index sweeps nprobe cheaply.
+  # Sweep nlist SMALL with nprobe=1: find the nlist where a query's true top-100 is (almost) all
+  # within its single nearest cluster. Recall here == "fraction of top-100 in the 1 nearest cluster".
+  # nlist is write-time (in the index key) so each value reindexes. Smaller nlist = bigger cells =
+  # more coverage per probe (nlist=1 is trivially 1.0: one cell = whole corpus).
+  # Find the LARGEST nlist (smallest cells = cheapest scan) that still gives 0.95+ recall at
+  # nprobe=20 with full-scan cells (subNprobe=subNlist). Recall here = coarse coverage of the 20
+  # nearest cells. nlist is write-time -> each value reindexes.
+  # Target operating point: coverage law says 0.95@nprobe=20 needs nlist~40 (big ~25k-doc cells).
+  # Per-cell navigable graph makes searching those big cells cheap. nlist is write-time -> reindex.
+  "ivfNlist": (500,),
+  # nprobe scans the same corpus FRACTION as a well-tuned high-nlist run (~1.3% of cells), which at
+  # 50 docs/cell means ~50*nprobe docs visited. Light (ScaNN-style) spilling instead of the heavy
+  # spillBits=30 exact-SOAR tax; the larger nprobe recovers the coverage.
+  # nprobe is a pure search-time scan budget for lloyd_ivf (reader honors -Dlloyd.nprobe), so ONE
+  # cached index serves this whole sweep. nprobe=256 gave ~0.86 recall; sweeping up to reach ~0.95.
+  # hier_ivf: nprobe is a pure search-time scan budget (reader honors -Dhier.nprobe), so this whole
+  # sweep reuses ONE cached index. At nlist=200 (~5000 docs/coarse cell) probe ~10-20 coarse cells.
+  "ivfNprobe": (30, 40),
+  # hier_ivf only: subNlist sub-centroids per coarse cell (WRITE-time → in the index key, a sweep
+  # reindexes). subNprobe sub-cells scanned per probed cell (SEARCH-time → reader honors
+  # -Dhier.subNprobe, reuses the cached index). At subNlist=25 each sub-cell holds ~200 docs;
+  # subNprobe=5 scans ~1000 docs/probed cell (~5000*5/25). Ignored for non-hier index types.
+  "ivfSubNlist": (25,),
+  # subNprobe = subNlist => sub-level is a NO-OP (scan every doc in each probed cell). This isolates
+  # the COARSE coverage ceiling: recall at nprobe=N == fraction of true top-100 within the N nearest
+  # clusters. Tests "are all 100 NN encompassed within the nearest (few) cluster(s)?".
+  # reuses ivfSubNprobe knob -> hier.efSearch (intra-cell graph beam). Sweep: within-cell recall knob.
+  "ivfSubNprobe": (256,),  # -> hier.efSearch (intra-cell beam)
+  "ivfClusterTrainDims": (1024,),
+  # Spilling DISABLED (spillBits=0): each doc lives in exactly one cell (its k-means assignment), so
+  # the merge skips the per-doc O(nlist*dim) spill-select scan entirely — that scan dominated merge
+  # time. Recall coverage that spilling would have bought is instead recovered by scanning more cells
+  # per query via the (adaptive) nprobe above.
+  "ivfSpillBits": (2,),
+  # SOAR is a spill-selection method; no-op when spillBits=0.
+  "ivfSoarLambda": (1.0,),
+  # hier_ivf: rerankFactor is SEARCH-time (reader honors -Dhier.rerankFactor); pool = factor*topK
+  # candidates from the int8 scan, re-scored EXACT against persisted rotated raw vectors. 1 == off.
+  # This sweep reuses ONE cached index (rerankFactor out of the key).
+  "ivfRerankFactor": (1,),  # 1-bit BlockQuant scan needs exact rerank backstop
+  # hier_ivf: workDims truncates the SUB-CELL routing scan to the top-W (Hadamard-rotated) dims.
+  # SEARCH-time (reader honors -Dhier.workDims), so this sweep reuses ONE cached index. 0 == full dim
+  # (1024). This is a RANDOM projection (Hadamard spreads energy uniformly) — measures how fast recall
+  # decays under JL truncation, i.e. how much headroom a data-aware PCA basis would have.
+  # LOCAL variance-sorted truncation now: each cell ranks sub-cells on its top-W highest-variance
+  # dims (search-time, reuses one index). 0 == full dim (exact). Tests whether local dim-selection
+  # recovers the sub-routing recall that GLOBAL/random truncation (earlier sweep) could not.
+  "ivfWorkDims": (0,),
+  "ivfCentroidRefineFactor": (1,),
+  "ivfPqSubspaces": (0,),
+  "ivfBlockSize": (0,),
   # LSH params (ignored unless indexType="lsh"). hashBits => up to 2^hashBits buckets;
   # nprobe buckets probed per query; rerankFactor>1 enables exact full-precision rerank.
   # bucketPoolFactor: multi-probe over-fetches bucketPoolFactor*nprobe buckets, re-ranks them by
@@ -363,15 +541,26 @@ PARAMS = {
   # so it is NOT in the index cache key and the same index is reused across thread counts. Results are
   # bit-identical to sequential (deterministic min-position merge). Sweep e.g. (1,2,4,8) for a latency A/B.
   "lshSearchThreads": (1,),
+  # GCUT (graph-cut IVF) partitioner knobs (ignored unless indexType="gcut"; write-time -> each value
+  # reindexes, and all are in the index key). Swept like any other PARAM.
+  #   gcutMode: GCUT_FREEZE (keep the cut, recompute centroids only) | GCUT_SEED (seed cut + Lloyd refine)
+  #   gcutSplitBy: "variance" (bisect largest Sum||x-mu||^2 -> shrinks cell radius / NN-cell-rank tail)
+  #                | "count" (bisect largest population -> balanced posting lists)
+  #   gcutBalancePenalty: lambda in density*(1+lambda*imbalance^2); higher => more compact children
+  #   gcutAxes: K principal axes tried per split (deepest valley wins); K>1 costs Kx per split
+  "gcutMode": ("GCUT_FREEZE",),
+  "gcutSplitBy": ("variance",),
+  "gcutBalancePenalty": (4.0,),
+  "gcutAxes": (1,2,),
   # HNSW params (ignored for ivf runs); defaults maxConn=16, beamWidth=100 for good recall.
-  "maxConn": (20,),
-  "beamWidthIndex": (300,),
+  "maxConn": (16,),
+  "beamWidthIndex": (100,),
   "fanout": (100,),
-  "numSearchThread": (4,),
+  "numSearchThread": (1,),
   "encoding": ("float32",),
   "metric": ("dot_product",),
-  # quantizeBits=32 is inert (no -quantize flag); present because print_run_summary expects the key.
-  "quantizeBits": (32,),
+  # 8-bit scalar-quantized HNSW, for a fair int8-vs-int8 comparison against the int8 lloyd_ivf codec.
+  "quantizeBits": (8,),
   "topK": (100,),
   "forceMerge": (True,),
   "nquery": (1000,),
@@ -2152,6 +2341,77 @@ def run_knn_benchmark(checkout, values, log_path):
   if LSH_REFERENCE_CENTROIDS_ONLY:
     cmd += ["-Dlsh.referenceCentroidsOnly=true"]
 
+  if IVF_CENTROID_HNSW is not None:
+    cmd += [f"-Divf.centroidHnsw={'true' if IVF_CENTROID_HNSW else 'false'}"]
+  if IVF_REFINE_FACTOR is not None:
+    cmd += [f"-Divf.refineFactor={IVF_REFINE_FACTOR}"]
+  if IVF_ADAPTIVE_NPROBE_MARGIN is not None:
+    cmd += [f"-Divf.adaptiveNprobeMargin={IVF_ADAPTIVE_NPROBE_MARGIN}"]
+  if LLOYD_BEAM_FACTOR is not None:
+    cmd += [f"-Dlloyd.beamFactor={LLOYD_BEAM_FACTOR}"]
+  if LLOYD_CEIL_AUDIT:
+    cmd += ["-Dlloyd.ceilAudit=true"]
+  if LLOYD_CEIL_DIR:
+    cmd += ["-Dlloyd.ceilDir=true"]
+  if LLOYD_CEIL_ANISO:
+    cmd += ["-Dlloyd.ceilAniso=true"]
+  if LLOYD_CEIL_SUB:
+    cmd += ["-Dlloyd.ceilSub=true"]
+  if LLOYD_CEIL_SEP:
+    cmd += ["-Dlloyd.ceilSep=true"]
+  if LLOYD_CEIL_ONLINE:
+    cmd += ["-Dlloyd.ceilOnline=true"]
+  if LLOYD_CEIL_ADJ:
+    cmd += ["-Dlloyd.ceilAdj=true"]
+  if LLOYD_CEIL_SELEXP:
+    cmd += ["-Dlloyd.ceilSelExp=true"]
+  if LLOYD_CEIL_BRUTE:
+    cmd += ["-Dlloyd.ceilBrute=true"]
+  if LLOYD_CEIL_SPILL:
+    cmd += ["-Dlloyd.ceilSpill=true"]
+  if GCUT_TREE_ROUTE_DIMS is not None:
+    cmd += [f"-Dgcut.treeRouteDims={GCUT_TREE_ROUTE_DIMS}"]
+  if GCUT_TREE_ROUTE:
+    cmd += ["-Dgcut.treeRoute=true"]
+  if LLOYD_BRUTE_SEARCH:
+    cmd += ["-Dlloyd.bruteSearch=true"]
+    cmd += ["-Dlloyd.ceilBruteDims=1024"]
+  if IVF_QUANT_BITS:
+    cmd += [f"-Divf.quantBits={IVF_QUANT_BITS}"]
+  if os.environ.get("IVF_CELL_ORDER", "1") == "1":
+    cmd += ["-Divf.cellOrder=true"]
+  if IVF_BEAM_SPILL:
+    cmd += ["-Divf.beamSpill=true"]
+    if IVF_SPILL_MARGIN:
+      cmd += [f"-Divf.spillMargin={IVF_SPILL_MARGIN}"]
+  if os.environ.get("LLOYD_DBG_CELL") == "1":
+    cmd += ["-Dlloyd.dbgCell=true"]
+  if LLOYD_SKETCH_SCAN:
+    cmd += ["-Dlloyd.sketchScan=true"]
+    if os.environ.get("LLOYD_BRUTE_N"):
+      cmd += [f'-Dlloyd.bruteN={os.environ["LLOYD_BRUTE_N"]}']
+    _sd = os.environ.get("LLOYD_SKETCH_DIMS", "1024")
+    cmd += [f"-Dlloyd.ceilBruteDims={_sd}"]
+    cmd += [f"-Dlloyd.sketchDims={_sd}"]
+    if LLOYD_RERANK_BITS:
+      cmd += [f"-Dlloyd.rerankBits={LLOYD_RERANK_BITS}"]
+  if IVF_RERANK_FACTOR is not None:
+    cmd += [f"-Divf.rerankFactor={IVF_RERANK_FACTOR}"]
+  if IVF_ENABLE_COPY_MERGE:
+    cmd += ["-Divf.enableCopyMerge=true"]
+  if IVF_EXACT_ASSIGN:
+    cmd += ["-Divf.exactAssign=true"]
+  if IVF_WORK_DIMS is not None:
+    cmd += [f"-Divf.workDims={IVF_WORK_DIMS}"]
+  if IVF_GRAPH_ROUTE_ITERS is not None:
+    cmd += [f"-Divf.graphRouteIters={IVF_GRAPH_ROUTE_ITERS}"]
+  if IVF_ANISO_ETA is not None:
+    cmd += [f"-Divf.anisoEta={IVF_ANISO_ETA}"]
+  if IVF_SHARED_CODES:
+    cmd += ["-Divf.sharedCodes=true"]
+  if IVF_DROP_RAW_VECTORS:
+    cmd += ["-Divf.dropRawVectors=true"]
+
   if DO_PROFILING:
     cmd += [
       f"-XX:StartFlightRecording=jdk.CPUTimeSample#enabled=true,dumponexit=true,maxsize={constants.JFR_MAX_SIZE_MB}M,settings={constants.BENCH_BASE_DIR}/src/python/profiling.jfc,filename={jfr_output}"
@@ -2964,6 +3224,77 @@ def build_java_base_cmd(checkout):
       cmd += ["-Dlsh.routeOnReferenceCentroids=true"]
   if LSH_REFERENCE_CENTROIDS_ONLY:
     cmd += ["-Dlsh.referenceCentroidsOnly=true"]
+
+  if IVF_CENTROID_HNSW is not None:
+    cmd += [f"-Divf.centroidHnsw={'true' if IVF_CENTROID_HNSW else 'false'}"]
+  if IVF_REFINE_FACTOR is not None:
+    cmd += [f"-Divf.refineFactor={IVF_REFINE_FACTOR}"]
+  if IVF_ADAPTIVE_NPROBE_MARGIN is not None:
+    cmd += [f"-Divf.adaptiveNprobeMargin={IVF_ADAPTIVE_NPROBE_MARGIN}"]
+  if LLOYD_BEAM_FACTOR is not None:
+    cmd += [f"-Dlloyd.beamFactor={LLOYD_BEAM_FACTOR}"]
+  if LLOYD_CEIL_AUDIT:
+    cmd += ["-Dlloyd.ceilAudit=true"]
+  if LLOYD_CEIL_DIR:
+    cmd += ["-Dlloyd.ceilDir=true"]
+  if LLOYD_CEIL_ANISO:
+    cmd += ["-Dlloyd.ceilAniso=true"]
+  if LLOYD_CEIL_SUB:
+    cmd += ["-Dlloyd.ceilSub=true"]
+  if LLOYD_CEIL_SEP:
+    cmd += ["-Dlloyd.ceilSep=true"]
+  if LLOYD_CEIL_ONLINE:
+    cmd += ["-Dlloyd.ceilOnline=true"]
+  if LLOYD_CEIL_ADJ:
+    cmd += ["-Dlloyd.ceilAdj=true"]
+  if LLOYD_CEIL_SELEXP:
+    cmd += ["-Dlloyd.ceilSelExp=true"]
+  if LLOYD_CEIL_BRUTE:
+    cmd += ["-Dlloyd.ceilBrute=true"]
+  if LLOYD_CEIL_SPILL:
+    cmd += ["-Dlloyd.ceilSpill=true"]
+  if GCUT_TREE_ROUTE_DIMS is not None:
+    cmd += [f"-Dgcut.treeRouteDims={GCUT_TREE_ROUTE_DIMS}"]
+  if GCUT_TREE_ROUTE:
+    cmd += ["-Dgcut.treeRoute=true"]
+  if LLOYD_BRUTE_SEARCH:
+    cmd += ["-Dlloyd.bruteSearch=true"]
+    cmd += ["-Dlloyd.ceilBruteDims=1024"]
+  if IVF_QUANT_BITS:
+    cmd += [f"-Divf.quantBits={IVF_QUANT_BITS}"]
+  if os.environ.get("IVF_CELL_ORDER", "1") == "1":
+    cmd += ["-Divf.cellOrder=true"]
+  if IVF_BEAM_SPILL:
+    cmd += ["-Divf.beamSpill=true"]
+    if IVF_SPILL_MARGIN:
+      cmd += [f"-Divf.spillMargin={IVF_SPILL_MARGIN}"]
+  if os.environ.get("LLOYD_DBG_CELL") == "1":
+    cmd += ["-Dlloyd.dbgCell=true"]
+  if LLOYD_SKETCH_SCAN:
+    cmd += ["-Dlloyd.sketchScan=true"]
+    if os.environ.get("LLOYD_BRUTE_N"):
+      cmd += [f'-Dlloyd.bruteN={os.environ["LLOYD_BRUTE_N"]}']
+    _sd = os.environ.get("LLOYD_SKETCH_DIMS", "1024")
+    cmd += [f"-Dlloyd.ceilBruteDims={_sd}"]
+    cmd += [f"-Dlloyd.sketchDims={_sd}"]
+    if LLOYD_RERANK_BITS:
+      cmd += [f"-Dlloyd.rerankBits={LLOYD_RERANK_BITS}"]
+  if IVF_RERANK_FACTOR is not None:
+    cmd += [f"-Divf.rerankFactor={IVF_RERANK_FACTOR}"]
+  if IVF_ENABLE_COPY_MERGE:
+    cmd += ["-Divf.enableCopyMerge=true"]
+  if IVF_EXACT_ASSIGN:
+    cmd += ["-Divf.exactAssign=true"]
+  if IVF_WORK_DIMS is not None:
+    cmd += [f"-Divf.workDims={IVF_WORK_DIMS}"]
+  if IVF_GRAPH_ROUTE_ITERS is not None:
+    cmd += [f"-Divf.graphRouteIters={IVF_GRAPH_ROUTE_ITERS}"]
+  if IVF_ANISO_ETA is not None:
+    cmd += [f"-Divf.anisoEta={IVF_ANISO_ETA}"]
+  if IVF_SHARED_CODES:
+    cmd += ["-Divf.sharedCodes=true"]
+  if IVF_DROP_RAW_VECTORS:
+    cmd += ["-Divf.dropRawVectors=true"]
   cmd += ["knn.KnnGraphTester"]
   return cmd
 

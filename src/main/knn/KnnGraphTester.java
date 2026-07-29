@@ -56,8 +56,8 @@ import org.apache.lucene.codecs.lucene104.Lucene104HnswScalarQuantizedVectorsFor
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader;
-import org.apache.lucene.sandbox.codecs.ivf.IVFVectorsFormat;
-import org.apache.lucene.sandbox.codecs.lsh.LSHVectorsFormat;
+import org.apache.lucene.sandbox.codecs.faiss.FaissKnnVectorsFormat;
+import org.apache.lucene.sandbox.codecs.lloydivf.LloydIVFVectorsFormat;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
@@ -148,8 +148,8 @@ public class KnnGraphTester implements FormatterLogger {
   enum IndexType {
     HNSW,
     FLAT,
-    IVF,
-    LSH
+    LLOYD_IVF,
+    FAISS
   }
 
   enum SearchType {
@@ -225,10 +225,41 @@ public class KnnGraphTester implements FormatterLogger {
   // IVF (org.apache.lucene.sandbox.codecs.ivf.IVFVectorsFormat) parameters
   private int ivfNlist;
   private int ivfNprobe;
+  // Hier IVF two-level knobs: subNlist sub-centroids per coarse cell (write-time), subNprobe sub-cells
+  // scanned per probed coarse cell (search-time). Only used when indexType == HIER_IVF.
+  private int ivfSubNlist = 100;
+  private int ivfSubNprobe = 8;
+  // Hier IVF search-time routing-truncation dim (0 == full dim). Forwarded to -Dhier.workDims.
+  private int ivfWorkDims = 0;
   private int ivfCentroidScanDims;
   private int ivfCentroidRefineFactor;
   private int ivfClusterTrainDims;
   private int ivfRerankFactor;
+  private int ivfSpillBits;
+  private int ivfPqSubspaces;
+  private int ivfPqKeptSubspaces;
+  // BlockQuant (block-sphere quantization) parameters. ivfBlockSize=0 => OFF; >0 selects the block
+  // quantizer with block size p (mutually exclusive with PQ). ivfBlockBits is bits-per-coordinate.
+  private int ivfBlockSize;
+  private int ivfBlockBits;
+  // k-means training quality (write-time only): more restarts/iters spend index time on tighter
+  // centroids, lowering the nprobe needed for a given recall.
+  private int ivfKmeansRestarts;
+  private int ivfKmeansIters;
+  // SOAR (ScaNN, Sun et al. NeurIPS 2023) spill-selection lambda for the IVF codec (write-time only).
+  // 0 (default) = plain nearest-k spill selection; >0 chooses spill centroids by the SOAR objective
+  // (residual + lambda * parallel-to-primary-residual penalty), so spill copies are complementary
+  // rather than redundant. Only matters when ivfSpillBits > 0. Passed straight to IVFVectorsFormat.
+  private float ivfSoarLambda;
+  // FAISS (org.apache.lucene.sandbox.codecs.faiss.FaissKnnVectorsFormat) parameters. This wraps the
+  // native Faiss library's index_factory, so it serves as a state-of-the-art IVF *baseline* to
+  // compare the pure-Java IVF codec against. faissDescription is the Faiss index-factory string and
+  // faissIndexParams the tuning params; both support "{nlist}" / "{nprobe}" placeholders that are
+  // substituted from ivfNlist / ivfNprobe, so an nlist/nprobe sweep drives Faiss and the Java IVF
+  // codec identically (just flip -indexType between ivf and faiss). Requires the native faiss-cpu
+  // shared libs on java.library.path / LD_LIBRARY_PATH (see FaissKnnVectorsFormat docs).
+  private String faissDescription;
+  private String faissIndexParams;
   // LSH (org.apache.lucene.sandbox.codecs.lsh.LSHVectorsFormat) parameters
   private int lshHashBits;
   private int lshNumTables;
@@ -309,17 +340,29 @@ public class KnnGraphTester implements FormatterLogger {
     numSearchThread = 0;
     queryStartIndex = 0;
     indexType = IndexType.HNSW;
-    ivfNlist = IVFVectorsFormat.DEFAULT_NLIST;
-    ivfNprobe = IVFVectorsFormat.DEFAULT_NPROBE;
-    ivfCentroidScanDims = IVFVectorsFormat.DEFAULT_CENTROID_SCAN_DIMS;
-    ivfCentroidRefineFactor = IVFVectorsFormat.DEFAULT_CENTROID_REFINE_FACTOR;
-    ivfClusterTrainDims = IVFVectorsFormat.DEFAULT_CLUSTER_TRAIN_DIMS;
-    ivfRerankFactor = IVFVectorsFormat.DEFAULT_RERANK_FACTOR;
-    lshHashBits = LSHVectorsFormat.DEFAULT_HASH_BITS;
-    lshNumTables = LSHVectorsFormat.DEFAULT_NUM_TABLES;
-    lshNprobe = LSHVectorsFormat.DEFAULT_NPROBE;
-    lshBucketPoolFactor = LSHVectorsFormat.DEFAULT_BUCKET_POOL_FACTOR;
-    lshRerankFactor = LSHVectorsFormat.DEFAULT_RERANK_FACTOR;
+    ivfNlist = LloydIVFVectorsFormat.DEFAULT_NLIST;
+    ivfNprobe = LloydIVFVectorsFormat.DEFAULT_NPROBE;
+    ivfCentroidScanDims = 0;
+    ivfCentroidRefineFactor = 1;
+    ivfClusterTrainDims = 0;
+    ivfRerankFactor = 1;
+    ivfSpillBits = LloydIVFVectorsFormat.DEFAULT_SPILL_BITS;
+    ivfPqSubspaces = 0;
+    ivfPqKeptSubspaces = 0;
+    ivfBlockSize = 0;
+    ivfBlockBits = 0;
+    ivfKmeansRestarts = LloydIVFVectorsFormat.DEFAULT_KMEANS_RESTARTS;
+    ivfKmeansIters = LloydIVFVectorsFormat.DEFAULT_KMEANS_ITERS;
+    ivfSoarLambda = LloydIVFVectorsFormat.DEFAULT_SOAR_LAMBDA;
+    // Faiss IVF baseline defaults: 8-bit scalar-quantized IVF, nlist cells from ivfNlist, nprobe
+    // from ivfNprobe -- structurally the closest Faiss analogue to the Java IVF 8-bit scalar codec.
+    faissDescription = "IVF{nlist},SQ8";
+    faissIndexParams = "nprobe={nprobe}";
+    lshHashBits = 16;
+    lshNumTables = 1;
+    lshNprobe = 1;
+    lshBucketPoolFactor = 1;
+    lshRerankFactor = 1;
     lshPcaDim = 0; // 0 = data-independent hash (no frozen PCA basis)
     lshItq = false; // when true (and PCA on), also train frozen per-table ITQ rotations
     lshQuantizeBits = 8; // OSQ posting precision (8 or 4)
@@ -351,46 +394,6 @@ public class KnnGraphTester implements FormatterLogger {
    * normalizes documents (L2 for COSINE) so the trained basis matches the bucketing space. Sampling is
    * a deterministic prefix of up to LSHHashTransform.MAX_SAMPLE vectors (training subsamples further).
    */
-  private void trainLshPcaBasis(Path docVectorsPath) throws IOException {
-    final int maxSample = 50_000; // matches LSHHashTransform.MAX_SAMPLE
-    boolean cosine = similarityFunction == VectorSimilarityFunction.COSINE;
-    try (FileChannel in = getVectorFileChannel(docVectorsPath, dim, vectorEncoding, !quiet)) {
-      VectorReader reader = VectorReader.create(in, dim, vectorEncoding, 0);
-      int available = (int) Math.min((long) numDocs, in.size() / ((long) dim * vectorEncoding.byteSize));
-      int sampleSize = Math.min(maxSample, available);
-      float[][] sample = new float[sampleSize][];
-      for (int i = 0; i < sampleSize; i++) {
-        float[] v = reader.next(); // reused buffer -> copy
-        float[] copy = ArrayUtil.copyOfSubArray(v, 0, dim);
-        if (cosine) {
-          VectorUtil.l2normalize(copy);
-        }
-        sample[i] = copy;
-      }
-      lshPcaBasis = null;
-      lshPcaMean = null;
-      float[][] basis = LSHVectorsFormat.trainPcaBasis(sample, lshPcaDim, 42L);
-      if (basis != null) {
-        lshPcaMean = basis[0];
-        lshPcaBasis = java.util.Arrays.copyOfRange(basis, 1, basis.length);
-        log("LSH: trained frozen PCA basis m=%d from %d sampled docs\n", lshPcaBasis.length, sampleSize);
-        if (lshItq) {
-          lshPcaItq =
-              LSHVectorsFormat.trainPcaItq(
-                  sample, lshPcaMean, lshPcaBasis, lshHashBits, lshNumTables, 42L);
-          if (lshPcaItq != null) {
-            log("LSH: trained frozen per-table ITQ rotations c=%d for %d tables\n",
-                lshPcaItq[0].length, lshNumTables);
-          } else {
-            log("LSH: ITQ training skipped/degenerate; using plain SimHash on the PCA subspace\n");
-          }
-        }
-      } else {
-        log("LSH: PCA basis training skipped/degenerate (lshPcaDim=%d); using data-independent hash\n", lshPcaDim);
-      }
-    }
-  }
-
   public static void main(String... args) throws Exception {
     new KnnGraphTester().runWithCleanUp(args);
   }
@@ -453,15 +456,16 @@ public class KnnGraphTester implements FormatterLogger {
             case "flat":
               indexType = IndexType.FLAT;
               break;
-            case "ivf":
-              indexType = IndexType.IVF;
+            case "lloyd_ivf":
+            case "lloydivf":
+              indexType = IndexType.LLOYD_IVF;
               break;
-            case "lsh":
-              indexType = IndexType.LSH;
+            case "faiss":
+              indexType = IndexType.FAISS;
               break;
             default:
               throw new IllegalArgumentException(
-                  "-indexType can be 'hnsw', 'flat', 'ivf' or 'lsh' only");
+                  "-indexType can be 'hnsw', 'flat', 'lloyd_ivf' or 'faiss' only");
           }
           break;
         case "-ivfNlist":
@@ -475,6 +479,24 @@ public class KnnGraphTester implements FormatterLogger {
             throw new IllegalArgumentException("-ivfNprobe requires a following int");
           }
           ivfNprobe = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfSubNlist":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfSubNlist requires a following int");
+          }
+          ivfSubNlist = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfSubNprobe":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfSubNprobe requires a following int");
+          }
+          ivfSubNprobe = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfWorkDims":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfWorkDims requires a following int");
+          }
+          ivfWorkDims = Integer.parseInt(args[++iarg]);
           break;
         case "-ivfCentroidScanDims":
           if (iarg == args.length - 1) {
@@ -499,6 +521,93 @@ public class KnnGraphTester implements FormatterLogger {
             throw new IllegalArgumentException("-ivfRerankFactor requires a following int");
           }
           ivfRerankFactor = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfSpillBits":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfSpillBits requires a following int");
+          }
+          ivfSpillBits = Integer.parseInt(args[++iarg]);
+          break;
+        // GCUT partitioner knobs. Passed for every indexType (swept via PARAMS), but only consumed
+        // when indexType=gcut. Each sets a -Dgcut.* / -DgcutMode sysprop read by GraphCutPartitioner
+        // / GCutIVFVectorsFormat at index build time, and is folded into the index key below.
+        case "-gcutMode":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-gcutMode requires a following value");
+          }
+          System.setProperty("gcutMode", args[++iarg]);
+          break;
+        case "-gcutSplitBy":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-gcutSplitBy requires a following value");
+          }
+          System.setProperty("gcut.splitBy", args[++iarg]);
+          break;
+        case "-gcutBalancePenalty":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-gcutBalancePenalty requires a following float");
+          }
+          System.setProperty("gcut.balancePenalty", args[++iarg]);
+          break;
+        case "-gcutAxes":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-gcutAxes requires a following int");
+          }
+          System.setProperty("gcut.axes", args[++iarg]);
+          break;
+        case "-ivfPqSubspaces":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfPqSubspaces requires a following int");
+          }
+          ivfPqSubspaces = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfPqKeptSubspaces":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfPqKeptSubspaces requires a following int");
+          }
+          ivfPqKeptSubspaces = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfBlockSize":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfBlockSize requires a following int");
+          }
+          ivfBlockSize = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfBlockBits":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfBlockBits requires a following int");
+          }
+          ivfBlockBits = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfKmeansRestarts":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfKmeansRestarts requires a following int");
+          }
+          ivfKmeansRestarts = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfKmeansIters":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfKmeansIters requires a following int");
+          }
+          ivfKmeansIters = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfSoarLambda":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfSoarLambda requires a following float");
+          }
+          ivfSoarLambda = Float.parseFloat(args[++iarg]);
+          break;
+        case "-faissDescription":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-faissDescription requires a following string");
+          }
+          faissDescription = args[++iarg];
+          break;
+        case "-faissIndexParams":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-faissIndexParams requires a following string");
+          }
+          faissIndexParams = args[++iarg];
           break;
         case "-lshHashBits":
           if (iarg == args.length - 1) {
@@ -843,7 +952,8 @@ public class KnnGraphTester implements FormatterLogger {
                                      rerank, rerankQuantizeBits,
                                      parentJoin, filterStrategy, filterSelectivity, randomSeed,
                                      docVectorsPath, numDocs, metric, forceMerge,
-                                     ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor,
+                                     ivfNlist, ivfNprobe, ivfSubNlist, ivfSubNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor, ivfSpillBits, ivfPqSubspaces, ivfPqKeptSubspaces, ivfBlockSize, ivfBlockBits, ivfKmeansRestarts, ivfKmeansIters, ivfSoarLambda,
+                                     faissDescription, faissIndexParams,
                                      lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaDim, lshItq, lshQuantizeBits, lshSpillBits, lshSoar, lshSoarLambda, lshNoRaw);
     log("index key = %s\n", indexKey);
     
@@ -880,14 +990,16 @@ public class KnnGraphTester implements FormatterLogger {
     // Per-segment LSH search parallelism (search-time; does NOT affect the index, hence not in the index
     // key). Set BEFORE any index is opened below, because LSHVectorsReader.SEARCH_THREADS is initialized
     // from this property when that class is first loaded (which happens on the first index open).
-    if (indexType == IndexType.LSH) {
-      System.setProperty("lsh.searchThreads", Integer.toString(lshSearchThreads));
-      // nprobe is a search-time scan budget (it changes which/how many buckets are selected, never
-      // the on-disk bytes), so it is NOT in the index key and one cached index serves any nprobe. The
-      // reader normally reads the value persisted at write time; this override (read into
-      // LSHVectorsReader.NPROBE_OVERRIDE at class load, like searchThreads) makes the SWEPT value win
-      // so an nprobe sweep reuses one index instead of reindexing per value. Set before first open.
-      System.setProperty("lsh.nprobe", Integer.toString(lshNprobe));
+    if (indexType == IndexType.LLOYD_IVF) {
+      // The Lloyd IVF codec reader honors -Dlloyd.nprobe as a search-time scan
+      // budget, so one cached index serves any swept nprobe and nprobe stays out of its index key.
+      System.setProperty("lloyd.nprobe", Integer.toString(ivfNprobe));
+      // The adaptive-prune margin is also search-time only; the reader honors -Dlloyd.margin, so the
+      // margin sweep reuses one cached index too. Only forward a real (0,1) margin; else leave unset.
+      String m = System.getProperty("ivf.adaptiveNprobeMargin");
+      if (m != null) {
+        System.setProperty("lloyd.margin", m);
+      }
     }
 
     int segmentCount;
@@ -905,32 +1017,6 @@ public class KnnGraphTester implements FormatterLogger {
         throw new IllegalArgumentException("-docs argument is required when indexing");
       }
 
-      // Select the LSH OSQ posting precision (8 or 4 bits) the writer will use. Read via the
-      // lsh.quantizeBits system property in LSHVectorsWriter.buildQuantizer; set before any segment
-      // flush AND before force-merge (the rebuild merge path re-quantizes), so all postings agree.
-      if (indexType == IndexType.LSH) {
-        System.setProperty("lsh.quantizeBits", Integer.toString(lshQuantizeBits));
-        // Index-time spilling factor (write-only); read in LSHVectorsWriter.spillBits(). Set before any
-        // segment flush AND before force-merge so flush and the rebuild-merge path agree (concat copies
-        // bytes verbatim, so it is spill-agnostic, but a rebuild must use the same spill factor).
-        System.setProperty("lsh.spillBits", Integer.toString(lshSpillBits));
-        // SOAR spill-selection (write-only, read in LSHVectorsWriter.soarEnabled/soarLambda). Same
-        // timing rationale as lsh.spillBits: set before flush AND force-merge so the rebuild-merge path
-        // (if taken) chooses the same spill buckets as flush. No-op unless lshSpillBits>0.
-        System.setProperty("lsh.soar", Boolean.toString(lshSoar));
-        System.setProperty("lsh.soarLambda", Double.toString(lshSoarLambda));
-        // Whether to persist the full-precision originals (read in LSHVectorsWriter.storeRawVectors()).
-        // false ⇒ empty .vec/.vemf and no raw copy at merge (the dominant >RAM merge cost). Set before
-        // flush AND force-merge so every segment + the merge agree on the on-disk layout.
-        System.setProperty("lsh.storeRawVectors", Boolean.toString(lshNoRaw == false));
-      }
-
-      // Train the frozen LSH PCA hash basis ONCE (if enabled) before building any segment, so every
-      // segment and the force-merge share the same (mu,V) and stay concat-mergeable.
-      if (indexType == IndexType.LSH && lshPcaDim > 0 && lshPcaMean == null) {
-        trainLshPcaBasis(docVectorsPath);
-      }
-
       KnnIndexer.FilterScheme indexTimeFilter;
 
       if (filterStrategy == null) {
@@ -946,7 +1032,7 @@ public class KnnGraphTester implements FormatterLogger {
       KnnIndexer.IndexResult indexResult = new KnnIndexer(
         docVectorsPath,
         indexPath,
-        getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits, ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor, lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq),
+        getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits, ivfNlist, ivfNprobe, ivfSubNlist, ivfSubNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor, ivfSpillBits, ivfPqSubspaces, ivfPqKeptSubspaces, ivfBlockSize, ivfBlockBits, ivfKmeansRestarts, ivfKmeansIters, ivfSoarLambda, faissDescription, faissIndexParams, lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq),
         numIndexThreads,
         vectorEncoding,
         dim,
@@ -958,7 +1044,10 @@ public class KnnGraphTester implements FormatterLogger {
         parentJoinMetaFile,
         useBp,
         indexTimeFilter,
-        rerank
+        rerank,
+        // Native Faiss codec: disable abortable background merges (fatal across the native FFI upcall
+        // if aborted mid-write); forceMerge consolidates afterwards. See KnnIndexer.noBackgroundMerge.
+        indexType == IndexType.FAISS
       ).createIndex();
       reindexTimeMsec = indexResult.indexTimeMsec();
       mergeTimeMsec = indexResult.mergeTimeMsec();
@@ -1250,8 +1339,13 @@ public class KnnGraphTester implements FormatterLogger {
                                        boolean parentJoin, FilterStrategy filterStrategy,
                                        Float filterSelectivity, Long randomSeed,
                                        Path docPath, int numDocs, String metric, boolean forceMerge,
-                                       int ivfNlist, int ivfNprobe, int ivfCentroidScanDims,
+                                       int ivfNlist, int ivfNprobe, int ivfSubNlist, int ivfSubNprobe,
+                                       int ivfCentroidScanDims,
                                        int ivfCentroidRefineFactor, int ivfClusterTrainDims, int ivfRerankFactor,
+                                       int ivfSpillBits, int ivfPqSubspaces, int ivfPqKeptSubspaces,
+                                       int ivfBlockSize, int ivfBlockBits,
+                                       int ivfKmeansRestarts, int ivfKmeansIters, float ivfSoarLambda,
+                                       String faissDescription, String faissIndexParams,
                                        int lshHashBits, int lshNumTables, int lshNprobe,
                                        int lshBucketPoolFactor, int lshRerankFactor, int lshPcaDim,
                                        boolean lshItq, int lshQuantizeBits, int lshSpillBits,
@@ -1283,62 +1377,31 @@ public class KnnGraphTester implements FormatterLogger {
     
     if (indexType == IndexType.FLAT) {
       suffix.add("flat");
-    } else if (indexType == IndexType.IVF) {
-      // nlist + clusterTrainDims are write-time params (they change the clustering / on-disk
-      // postings). nprobe/centroidScanDims/centroidRefineFactor/rerankFactor are search-time but are
-      // PERSISTED in the index meta at write time (the reader is SPI-instantiated with no caller
-      // config -- see IVFVectorsWriter), so a cached index bakes them in -- include them all here so a
-      // sweep reindexes per combo (and so an IVF run never reuses an HNSW index dir).
-      suffix.add("ivf");
+    } else if (indexType == IndexType.FAISS) {
+      // Faiss bakes the full index (description + the nprobe applied via ParameterSpace at build
+      // time) into the serialized blob, so both belong in the key. nlist/nprobe are substituted the
+      // same way getCodec does. Sanitize commas/spaces so the value stays a single path segment.
+      suffix.add("faiss");
+      String desc = faissDescription.replace("{nlist}", Integer.toString(ivfNlist))
+                                    .replace("{nprobe}", Integer.toString(ivfNprobe));
+      String params = faissIndexParams.replace("{nlist}", Integer.toString(ivfNlist))
+                                      .replace("{nprobe}", Integer.toString(ivfNprobe));
+      suffix.add((desc + "_" + params).replaceAll("[^A-Za-z0-9]", ""));
+    } else if (indexType == IndexType.LLOYD_IVF) {
+      // Minimal Lloyd IVF. nlist/spillBits/soar/kmeans are baked into the on-disk index. nprobe is a
+      // pure search-time scan budget: the reader honors a -Dlloyd.nprobe override (set above from
+      // ivfNprobe), so it is OMITTED from the key and one cached index serves every swept nprobe.
+      suffix.add("lloydivf");
       suffix.add("nl" + ivfNlist);
-      suffix.add("ctd" + ivfClusterTrainDims);
-      suffix.add("np" + ivfNprobe);
-      suffix.add("csd" + ivfCentroidScanDims);
-      suffix.add("crf" + ivfCentroidRefineFactor);
-      suffix.add("rr" + ivfRerankFactor);
-    } else if (indexType == IndexType.LSH) {
-      // lshHashBits changes the on-disk bucketing. nprobe is persisted in the index meta at write
-      // time, BUT the reader honors a -Dlsh.nprobe search-time override (set above from lshNprobe), so
-      // it is NOT a write-time-only param — it is OMITTED from the key so an nprobe sweep reuses ONE
-      // cached index instead of reindexing per value. rerankFactor stays in the key: it is persisted
-      // and has no override, so a cached index bakes it in.
-      suffix.add("lsh");
-      suffix.add(Integer.toString(lshHashBits));
-      suffix.add("L" + lshNumTables);
-      suffix.add("bpf" + lshBucketPoolFactor);
-      suffix.add("rr" + lshRerankFactor);
-      suffix.add("pca" + lshPcaDim);
-      if (lshItq) {
-        // ITQ changes the on-disk bucketing (and the persisted rotation), so a cached non-ITQ index
-        // must not be reused for an ITQ run.
-        suffix.add("itq");
+      suffix.add("sp" + ivfSpillBits);
+      if (ivfSpillBits > 0 && ivfSoarLambda > 0) {
+        suffix.add("soar" + ivfSoarLambda);
       }
-      // OSQ precision changes the persisted posting bytes + encoding id, so 8-bit and 4-bit indexes
-      // must not be reused for each other.
-      suffix.add("q" + lshQuantizeBits);
-      // Spilling changes which buckets each doc lands in (the on-disk postings), so a spilled index
-      // must not be reused for a non-spilled run (and vice versa). Omit when off to keep legacy keys.
-      if (lshSpillBits > 0) {
-        suffix.add("sp" + lshSpillBits);
-        // SOAR only affects WHICH buckets spill copies go to, so it only matters when spilling is on.
-        // It changes the on-disk postings, so a SOAR index must not be reused for a non-SOAR run, and
-        // each lambda is a distinct bucketing. Omit when off to keep legacy (plain-spill) keys stable.
-        if (lshSoar) {
-          suffix.add("soar" + lshSoarLambda);
-        }
+      if (ivfKmeansRestarts != LloydIVFVectorsFormat.DEFAULT_KMEANS_RESTARTS) {
+        suffix.add("kmr" + ivfKmeansRestarts);
       }
-      // Dropping the stored originals changes which files exist on disk (empty .vec/.vemf) and disables
-      // rerank/exact-fallback, so a no-raw index must not be reused for a normal run. Omit when off to
-      // keep legacy keys stable.
-      if (lshNoRaw) {
-        suffix.add("noraw");
-      }
-      // referenceCentroidsOnly changes the on-disk format (no TRUE centroids: centroidsLength==0, and
-      // the radius is reference-anchored), so a reference-only index must NOT be reused for a normal
-      // run or vice versa. It is a write-time system property (not a tester arg), so read it here.
-      // Omit when off to keep legacy keys stable.
-      if (Boolean.getBoolean("lsh.referenceCentroidsOnly")) {
-        suffix.add("refc");
+      if (ivfKmeansIters != LloydIVFVectorsFormat.DEFAULT_KMEANS_ITERS) {
+        suffix.add("kmi" + ivfKmeansIters);
       }
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
@@ -1430,12 +1493,13 @@ public class KnnGraphTester implements FormatterLogger {
       log("flat has no graphs\n");
       return;
     }
-    if (indexType == IndexType.IVF) {
-      log("ivf has no graphs\n");
+    if (indexType == IndexType.LLOYD_IVF) {
+      log("lloyd_ivf has no graphs\n");
       return;
     }
-    if (indexType == IndexType.LSH) {
-      log("lsh has no graphs\n");
+    if (indexType == IndexType.FAISS) {
+      // Faiss owns its own on-disk structure (opaque blob); no Lucene HNSW graph to walk.
+      log("faiss has no Lucene graphs\n");
       return;
     }
     try (Directory dir = FSDirectory.open(indexPath);
@@ -1461,7 +1525,7 @@ public class KnnGraphTester implements FormatterLogger {
   @SuppressForbidden(reason = "Prints stuff")
   private double forceMerge() throws IOException, InterruptedException {
     IndexWriterConfig iwc = new IndexWriterConfig().setOpenMode(IndexWriterConfig.OpenMode.APPEND);
-    iwc.setCodec(getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits, ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor, lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq));
+    iwc.setCodec(getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits, ivfNlist, ivfNprobe, ivfSubNlist, ivfSubNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor, ivfSpillBits, ivfPqSubspaces, ivfPqKeptSubspaces, ivfBlockSize, ivfBlockBits, ivfKmeansRestarts, ivfKmeansIters, ivfSoarLambda, faissDescription, faissIndexParams, lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor, lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq));
     KnnIndexer.TrackingConcurrentMergeScheduler tcms = new KnnIndexer.TrackingConcurrentMergeScheduler();
     iwc.setMergeScheduler(tcms);
     KnnIndexer.TrackingTieredMergePolicy ttmp = new KnnIndexer.TrackingTieredMergePolicy();
@@ -1664,6 +1728,20 @@ public class KnnGraphTester implements FormatterLogger {
             }
             resultIds[i] = ids;
           }
+          // -Dknn.dumpOrdToId=<path>: write luceneOrd<TAB>storedId for every doc, so offline analysis
+          // can join the codec's per-cell assignment (keyed by lucene ord) against the exact-NN file
+          // (keyed by stored id). One line per doc across all segments.
+          String ordToId = System.getProperty("knn.dumpOrdToId");
+          if (ordToId != null) {
+            try (java.io.PrintWriter pw = new java.io.PrintWriter(
+                java.nio.file.Files.newBufferedWriter(java.nio.file.Paths.get(ordToId)))) {
+              StoredFields sf = reader.storedFields();
+              for (int d = 0; d < reader.maxDoc(); d++) {
+                String id = sf.document(d, java.util.Set.of(ID_FIELD)).get(ID_FIELD);
+                pw.println(d + "\t" + id);
+              }
+            }
+          }
           log(
               "completed "
               + numQueryVectors
@@ -1698,6 +1776,22 @@ public class KnnGraphTester implements FormatterLogger {
       }
     } else {
       log("checking results\n");
+
+      // Per-query recall dump (-Dknn.perQueryDump=<path>): one line per query with its individual
+      // recall, so we can look for PATTERNS in which queries fail instead of theorizing. Columns:
+      // queryIdx, matched, expected, recall.
+      String pqDump = System.getProperty("knn.perQueryDump");
+      if (pqDump != null) {
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(java.nio.file.Files.newBufferedWriter(
+            java.nio.file.Paths.get(pqDump)))) {
+          pw.println("queryIdx\tmatched\texpected\trecall");
+          for (int i = 0; i < resultIds.length; i++) {
+            int m = compareNN(nn[i], resultIds[i]);
+            pw.printf(Locale.ROOT, "%d\t%d\t%d\t%.4f%n", i, m, nn[i].length, m / (float) nn[i].length);
+          }
+        }
+        log("wrote per-query recall dump to %s\n", pqDump);
+      }
 
       RecallResult result = checkResults(resultIds, nn);
       float recall = result.recall;
@@ -2434,7 +2528,6 @@ public class KnnGraphTester implements FormatterLogger {
    */
   private boolean exactNNFromDocsFile() {
     return lshNoRaw
-        && indexType == IndexType.LSH
         && parentJoin == false
         && filterStrategy == null
         && searchType == SearchType.KNN
@@ -2790,33 +2883,50 @@ public class KnnGraphTester implements FormatterLogger {
   static Codec getCodec(int maxConn, int beamWidth, ExecutorService exec, int numMergeWorker,
                         boolean quantize, int quantizeBits, IndexType indexType,
                         boolean rerank, int rerankQuantizeBits,
-                        int ivfNlist, int ivfNprobe, int ivfCentroidScanDims,
+                        int ivfNlist, int ivfNprobe, int ivfSubNlist, int ivfSubNprobe,
+                        int ivfCentroidScanDims,
                         int ivfCentroidRefineFactor, int ivfClusterTrainDims, int ivfRerankFactor,
+                        int ivfSpillBits, int ivfPqSubspaces, int ivfPqKeptSubspaces,
+                        int ivfBlockSize, int ivfBlockBits,
+                        int ivfKmeansRestarts, int ivfKmeansIters, float ivfSoarLambda,
+                        String faissDescription, String faissIndexParams,
                         int lshHashBits, int lshNumTables, int lshNprobe, int lshBucketPoolFactor, int lshRerankFactor,
         float[] lshPcaMean, float[][] lshPcaBasis, float[][][] lshPcaItq) {
-      if (indexType == IndexType.IVF) {
-          // Disk-searchable IVF: self-contained, bypasses the quantize/rerank paths above.
-          final KnnVectorsFormat ivfFormat =
-              new IVFVectorsFormat(
-                  ivfNlist, ivfNprobe, ivfCentroidScanDims, ivfCentroidRefineFactor, ivfClusterTrainDims, ivfRerankFactor);
+      if (indexType == IndexType.FAISS) {
+          // Native Faiss baseline (org.apache.lucene.sandbox.codecs.faiss.FaissKnnVectorsFormat).
+          // Substitute {nlist}/{nprobe} placeholders from the shared IVF sweep knobs so Faiss and the
+          // Java IVF codec are driven by the same nlist/nprobe grid. Requires the native faiss-cpu libs.
+          String desc = faissDescription.replace("{nlist}", Integer.toString(ivfNlist))
+                                        .replace("{nprobe}", Integer.toString(ivfNprobe));
+          String params = faissIndexParams.replace("{nlist}", Integer.toString(ivfNlist))
+                                          .replace("{nprobe}", Integer.toString(ivfNprobe));
+          final KnnVectorsFormat faissFormat = new FaissKnnVectorsFormat(desc, params);
           return new Lucene104Codec() {
               @Override
               public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
-                  return ivfFormat;
+                  return faissFormat;
               }
           };
       }
-      if (indexType == IndexType.LSH) {
-          // Disk-searchable LSH: self-contained, bypasses the quantize/rerank paths. Bucketing is
-          // either data-independent (no PCA) or uses a FROZEN PCA basis (lshPcaMean/lshPcaBasis,
-          // trained once by the harness) that corrects rotational anisotropy while staying merge-stable.
-          final KnnVectorsFormat lshFormat =
-              new LSHVectorsFormat(lshHashBits, lshNumTables, lshNprobe, lshBucketPoolFactor,
-                                   lshRerankFactor, lshPcaMean, lshPcaBasis, lshPcaItq);
+      if (indexType == IndexType.LLOYD_IVF) {
+          // Minimal "Lloyd IVF": the hot IVF index/search path only. Reuses the ivf* nlist/nprobe/
+          // spillBits/soarLambda/kmeans knobs; drop-raw + shared-codes + OSQ are always on. nprobe is
+          // persisted (no system-property override), so a sweep reindexes -- keep it in the index key.
+          // Adaptive-nprobe margin comes from the same -Divf.adaptiveNprobeMargin knob the IVF codec
+          // uses (set by the harness); a value in (0,1) enables the early-stop trim, else it's disabled.
+          float lloydAdaptiveMargin =
+              Float.parseFloat(System.getProperty("ivf.adaptiveNprobeMargin", "1.0"));
+          if (lloydAdaptiveMargin <= 0f || lloydAdaptiveMargin >= 1f) {
+              lloydAdaptiveMargin = LloydIVFVectorsFormat.DEFAULT_ADAPTIVE_NPROBE_MARGIN;
+          }
+          final KnnVectorsFormat lloydFormat =
+              new LloydIVFVectorsFormat(
+                  ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfKmeansRestarts, ivfKmeansIters,
+                  lloydAdaptiveMargin);
           return new Lucene104Codec() {
               @Override
               public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
-                  return lshFormat;
+                  return lloydFormat;
               }
           };
       }
@@ -2827,31 +2937,31 @@ public class KnnGraphTester implements FormatterLogger {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
+                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 2 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
+                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 4 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
+                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 7 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
+                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 8 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVF, LSH -> throw new AssertionError("IVF/LSH handled above");
+                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               default -> throw new IllegalArgumentException("Unsupported quantizeBits: " + quantizeBits);
           };

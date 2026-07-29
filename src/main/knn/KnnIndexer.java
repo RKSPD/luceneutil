@@ -45,6 +45,7 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.MergePolicy.OneMerge;
 import org.apache.lucene.index.MergeRateLimiter;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.MergeTrigger;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
@@ -69,7 +70,9 @@ public class KnnIndexer implements FormatterLogger {
   // Smaller flushes shrink the per-segment live set so GC has headroom; the extra (cheap concat-path)
   // merges are absorbed by the single-table merge. Raise back toward 128 for low-hashBits builds where
   // the per-segment centroid arrays are small and bigger buffers index faster.
-  private static final double WRITER_BUFFER_MB = 32;
+  private static final double WRITER_BUFFER_MB = 512;
+  // Large buffer for native (Faiss) indexing so few, large (>> nlist) segments flush -- see usage.
+  private static final double NATIVE_WRITER_BUFFER_MB = 1024;
 
   private final Path docsPath;
   private final Path indexPath;
@@ -88,12 +91,18 @@ public class KnnIndexer implements FormatterLogger {
   private final TrackingConcurrentMergeScheduler tcms;
   private final TrackingTieredMergePolicy ttmp;
   private final boolean rerank;
+  // When true, disable abortable BACKGROUND merges during the build pass (use NoMergePolicy). Needed
+  // for native codecs (Faiss) whose merge writes vectors via a native->Java writeBytes upcall: a
+  // MergeAbortedException thrown across that FFI frame when a running merge is aborted at commit/close
+  // is a fatal, unrecoverable JVM error. With no background merges nothing gets aborted; consolidation
+  // is left to the explicit forceMerge() pass, which runs to completion with nothing racing it.
+  private final boolean noBackgroundMerge;
 
   public KnnIndexer(Path docsPath, Path indexPath, Codec codec, int numIndexThreads,
                     VectorEncoding vectorEncoding, int dim,
                     VectorSimilarityFunction similarityFunction, int numDocs, int docsStartIndex, boolean quiet,
                     boolean parentJoin, Path parentJoinMetaPath, boolean useBp, FilterScheme filterScheme,
-                    boolean rerank) {
+                    boolean rerank, boolean noBackgroundMerge) {
     this.docsPath = docsPath;
     this.indexPath = indexPath;
     this.codec = codec;
@@ -109,6 +118,7 @@ public class KnnIndexer implements FormatterLogger {
     this.useBp = useBp;
     this.filterScheme = filterScheme;
     this.rerank = rerank;
+    this.noBackgroundMerge = noBackgroundMerge;
     this.tcms = new TrackingConcurrentMergeScheduler();
     this.ttmp = new TrackingTieredMergePolicy();
   }
@@ -122,7 +132,11 @@ public class KnnIndexer implements FormatterLogger {
     iwc.setCodec(codec);
     iwc.setMergeScheduler(tcms);
     // iwc.setMergePolicy(NoMergePolicy.INSTANCE);
-    iwc.setRAMBufferSizeMB(WRITER_BUFFER_MB);
+    // Native codecs (Faiss) train one IVF per flushed segment and Faiss k-means hard-fails
+    // (FAISS_EXCEPT) on a segment with fewer than nlist training points. A small RAM buffer flushes
+    // many small segments (esp. the per-DWPT remainders), so use a large buffer to flush few large
+    // segments (each >> nlist); forceMerge then retrains once on all docs. Java codecs keep 32 MB.
+    iwc.setRAMBufferSizeMB(noBackgroundMerge ? NATIVE_WRITER_BUFFER_MB : WRITER_BUFFER_MB);
     
     iwc.setUseCompoundFile(false);
     // iwc.setMaxBufferedDocs(10000);
@@ -131,13 +145,19 @@ public class KnnIndexer implements FormatterLogger {
     iwc.setMaxFullFlushMergeWaitMillis(0);
 
     // aim for more compact/realistic index:
-    
+
     iwc.setMergePolicy(ttmp);
     ttmp.setFloorSegmentMB(256);
     iwc.getCodec().compoundFormat().setShouldUseCompoundFile(false);
     // tmp.setSegmentsPerTier(5);
     if (useBp) {
       iwc.setMergePolicy(new BPReorderingMergePolicy(iwc.getMergePolicy(), new BpVectorReorderer(KnnGraphTester.KNN_FIELD)));
+    }
+
+    // Native codecs (Faiss): no abortable background merges during the build pass -- see field docs.
+    // The per-segment index stays as flushed; forceMerge() consolidates afterwards without a race.
+    if (noBackgroundMerge) {
+      iwc.setMergePolicy(NoMergePolicy.INSTANCE);
     }
 
     ConcurrentMergeScheduler cms = (ConcurrentMergeScheduler) iwc.getMergeScheduler();
@@ -147,6 +167,7 @@ public class KnnIndexer implements FormatterLogger {
         switch (vectorEncoding) {
           case BYTE -> KnnByteVectorField.createFieldType(dim, similarityFunction);
           case FLOAT32 -> KnnFloatVectorField.createFieldType(dim, similarityFunction);
+          default -> throw new IllegalArgumentException("unsupported vector encoding: " + vectorEncoding);
         };
     if (rerank && vectorEncoding != VectorEncoding.FLOAT32) {
       throw new IllegalArgumentException("rerank requires FLOAT32 vector encoding");
@@ -174,10 +195,14 @@ public class KnnIndexer implements FormatterLogger {
       VectorReader vectorReader = VectorReader.create(in, dim, vectorEncoding, docsStartIndex);
       log("parentJoin=%s\n", parentJoin);
       if (parentJoin == false) {
-        ExecutorService exec = Executors.newFixedThreadPool(numIndexThreads);
+        // Native codecs (Faiss): index single-threaded so flushes are driven only by the (large) RAM
+        // buffer -- one DWPT means no small per-thread remainder segments that would fail Faiss's
+        // per-segment k-means (needs >= nlist points). Java codecs keep the requested thread count.
+        int effectiveIndexThreads = noBackgroundMerge ? 1 : numIndexThreads;
+        ExecutorService exec = Executors.newFixedThreadPool(effectiveIndexThreads);
         AtomicInteger numDocsIndexed = new AtomicInteger();
         List<Thread> threads = new ArrayList<>();
-        for (int i=0;i<numIndexThreads;i++) {
+        for (int i=0;i<effectiveIndexThreads;i++) {
           Thread t = new IndexerThread(iw, dim, vectorReader, vectorEncoding, fieldType, numDocsIndexed, numDocs, filterScheme, rerankFieldType);
           t.setDaemon(true);
           t.start();

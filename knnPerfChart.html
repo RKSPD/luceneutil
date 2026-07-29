@@ -8,8 +8,11 @@
       google.setOnLoadCallback(drawChart);
       function drawChart() {
         var data = google.visualization.arrayToDataTable([
-['', 'baseline'],
-[0.597, 11.166],
+['', "{'-ivfNprobe': '30', '-gcutAxes': '1'}", "{'-ivfNprobe': '30', '-gcutAxes': '2'}", "{'-ivfNprobe': '40', '-gcutAxes': '1'}", "{'-ivfNprobe': '40', '-gcutAxes': '2'}"],
+[0.905, 9.54, null, null, null],
+[0.905, null, 9.32, null, null],
+[0.914, null, null, 12.7, null],
+[0.914, null, null, null, 12.06],
         ]);
 
         var options = {

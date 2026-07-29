@@ -19,14 +19,14 @@
 Collects only execution and method samples at a low interval
 -->
 <configuration version="2.0" label="TestProfiling" description="Sampling for unit tests" provider="Apache">
-  <!-- turn this off so we only sample by CPU time -->
-  <!-- <event name="jdk.ExecutionSample">
+  <!-- jdk.CPUTimeSample yields 0 events on this JDK/OS; use the standard time-based sampler. -->
+  <event name="jdk.ExecutionSample">
     <setting name="enabled">true</setting>
     <setting name="period">1 ms</setting>
-  </event> -->
+  </event>
 
   <event name="jdk.CPUTimeSample">
-    <setting name="enabled">true</setting>
+    <setting name="enabled">false</setting>
     <setting name="throttle">1 ms</setting>
   </event>
 

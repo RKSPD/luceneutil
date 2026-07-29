@@ -37,6 +37,7 @@ public abstract class VectorReader {
     return switch (vectorEncoding) {
       case BYTE -> new VectorReaderByte(input, dim, bufferSize, vectorStartIndex);
       case FLOAT32 -> new VectorReaderFloat32(input, dim, bufferSize, vectorStartIndex);
+      default -> throw new IllegalArgumentException("unsupported vector encoding: " + vectorEncoding);
     };
   }
 

@@ -107,7 +107,7 @@ public class KnnIndexerMain {
                    KnnGraphTester.getCodec(inputs.maxConn, inputs.beamWidth, exec, numMergeWorker, quantize, quantizeBits, KnnGraphTester.IndexType.HNSW, quantizeCompress),
                    numMergeThread, inputs.vectorEncoding,
                    inputs.dimension, inputs.similarityFunction, inputs.numDocs, inputs.docStartIndex, inputs.quiet,
-                   inputs.parentJoin, inputs.parentJoinMetaFile, inputs.useBp, null).createIndex();
+                   inputs.parentJoin, inputs.parentJoinMetaFile, inputs.useBp, null, false, false).createIndex();
 
     if (!inputs.quiet) {
       System.out.println("Successfully created index.");

@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # --- config -------------------------------------------------------------------
-LUCENE_DIR=/Users/rikhil/Desktop/lucene
+LUCENE_DIR="${LUCENE_DIR:-/Users/rikhil/Desktop/lucene-lshivf}"
 LUCENEUTIL_DIR=/Users/rikhil/Desktop/luceneutil
 JAVA_HOME=/Library/Java/JavaVirtualMachines/amazon-corretto-26.jdk/Contents/Home
 PYTHON=python3
