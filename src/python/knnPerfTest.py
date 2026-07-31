@@ -158,6 +158,10 @@ IVF_TRAIN_SAMPLE_CAP = os.environ.get("IVF_TRAIN_SAMPLE_CAP")
 # tuned at nlist=2000; a 100k-centroid graph needs more connectivity or routing recall drops, which shows
 # up as missed cells (direct recall loss), not as an error. WRITE-time => in the index key.
 IVF_CENTROID_HNSW_M = os.environ.get("IVF_CENTROID_HNSW_M")
+# Derived (fixed random topology) centroid graph: no HNSW build, adjacency from a seed. WRITE-time
+# (changes routing/spill) => in the index key.
+IVF_DERIVED_GRAPH = os.environ.get("IVF_DERIVED_GRAPH") == "1"
+IVF_DERIVED_GRAPH_M = os.environ.get("IVF_DERIVED_GRAPH_M")
 IVF_CENTROID_HNSW_BEAM_WIDTH = os.environ.get("IVF_CENTROID_HNSW_BEAM_WIDTH")
 # Beam ef for the per-doc spill fan-out. With IVF_BEAM_SPILL=1 the SOAR pool is max(4*spillPerDoc, 64)
 # instead of ALL nlist, which is what makes spill affordable at large nlist (the full scan is
@@ -467,7 +471,7 @@ NOISY = True
 
 # test parameters. This script will run KnnGraphTester on every combination of these parameters
 PARAMS = {
-  "ndoc": (39_767_748,),
+  "ndoc": (1_000_000,),
   "indexType": ("lloyd_ivf",),
   # IVF params (ignored for hnsw runs)
   # Target ~50 docs/Voronoi cell: nlist = ndoc / 50 = 1_000_000 / 50 = 20_000.
@@ -483,7 +487,7 @@ PARAMS = {
   # nearest cells. nlist is write-time -> each value reindexes.
   # Target operating point: coverage law says 0.95@nprobe=20 needs nlist~40 (big ~25k-doc cells).
   # Per-cell navigable graph makes searching those big cells cheap. nlist is write-time -> reindex.
-  "ivfNlist": (100_000,),
+  "ivfNlist": (2_000,),
   # nprobe scans the same corpus FRACTION as a well-tuned high-nlist run (~1.3% of cells), which at
   # 50 docs/cell means ~50*nprobe docs visited. Light (ScaNN-style) spilling instead of the heavy
   # spillBits=30 exact-SOAR tax; the larger nprobe recovers the coverage.
@@ -491,7 +495,7 @@ PARAMS = {
   # cached index serves this whole sweep. nprobe=256 gave ~0.86 recall; sweeping up to reach ~0.95.
   # hier_ivf: nprobe is a pure search-time scan budget (reader honors -Dhier.nprobe), so this whole
   # sweep reuses ONE cached index. At nlist=200 (~5000 docs/coarse cell) probe ~10-20 coarse cells.
-  "ivfNprobe": (40, 55, 70, 90, 120),
+  "ivfNprobe": (55, 70),
   # hier_ivf only: subNlist sub-centroids per coarse cell (WRITE-time → in the index key, a sweep
   # reindexes). subNprobe sub-cells scanned per probed cell (SEARCH-time → reader honors
   # -Dhier.subNprobe, reuses the cached index). At subNlist=25 each sub-cell holds ~200 docs;
@@ -514,7 +518,7 @@ PARAMS = {
   # key, so each value reindexes. Goes hand-in-hand with ivfSpillBits: better-converged centroids make
   # each spill copy land in a more useful cell.
   "ivfFlushIters": (5,),
-  "ivfSpillBits": (3,),
+  "ivfSpillBits": (2,),
   # SOAR is a spill-selection method; no-op when spillBits=0.
   "ivfSoarLambda": (1.0,),
   # hier_ivf: rerankFactor is SEARCH-time (reader honors -Dhier.rerankFactor); pool = factor*topK
@@ -2430,6 +2434,10 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f"-Divf.streamRefineIters={IVF_STREAM_REFINE_ITERS}"]
   if IVF_CENTROID_HNSW_M is not None:
     cmd += [f"-Divf.centroidHnswM={IVF_CENTROID_HNSW_M}"]
+  if IVF_DERIVED_GRAPH:
+    cmd += ["-Divf.derivedGraph=true"]
+  if IVF_DERIVED_GRAPH_M is not None:
+    cmd += [f"-Divf.derivedGraphM={IVF_DERIVED_GRAPH_M}"]
   if IVF_CENTROID_HNSW_BEAM_WIDTH is not None:
     cmd += [f"-Divf.centroidHnswBeamWidth={IVF_CENTROID_HNSW_BEAM_WIDTH}"]
   if IVF_SPILL_EF_SEARCH is not None:
@@ -3360,6 +3368,10 @@ def build_java_base_cmd(checkout):
     cmd += [f"-Divf.streamRefineIters={IVF_STREAM_REFINE_ITERS}"]
   if IVF_CENTROID_HNSW_M is not None:
     cmd += [f"-Divf.centroidHnswM={IVF_CENTROID_HNSW_M}"]
+  if IVF_DERIVED_GRAPH:
+    cmd += ["-Divf.derivedGraph=true"]
+  if IVF_DERIVED_GRAPH_M is not None:
+    cmd += [f"-Divf.derivedGraphM={IVF_DERIVED_GRAPH_M}"]
   if IVF_CENTROID_HNSW_BEAM_WIDTH is not None:
     cmd += [f"-Divf.centroidHnswBeamWidth={IVF_CENTROID_HNSW_BEAM_WIDTH}"]
   if IVF_SPILL_EF_SEARCH is not None:

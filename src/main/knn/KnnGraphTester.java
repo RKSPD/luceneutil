@@ -1485,6 +1485,10 @@ public class KnnGraphTester implements FormatterLogger {
       if (chb != null) {
         suffix.add("chb" + chb);
       }
+      // Derived (fixed random topology) graph changes routing/spill, so it belongs in the key.
+      if (Boolean.getBoolean("ivf.derivedGraph")) {
+        suffix.add("dg" + System.getProperty("ivf.derivedGraphM", "64"));
+      }
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
       suffix.add(Integer.toString(maxConn));
