@@ -246,6 +246,7 @@ public class KnnGraphTester implements FormatterLogger {
   // centroids, lowering the nprobe needed for a given recall.
   private int ivfKmeansRestarts;
   private int ivfKmeansIters;
+  private int ivfFlushIters;
   // SOAR (ScaNN, Sun et al. NeurIPS 2023) spill-selection lambda for the IVF codec (write-time only).
   // 0 (default) = plain nearest-k spill selection; >0 chooses spill centroids by the SOAR objective
   // (residual + lambda * parallel-to-primary-residual penalty), so spill copies are complementary
@@ -353,6 +354,7 @@ public class KnnGraphTester implements FormatterLogger {
     ivfBlockBits = 0;
     ivfKmeansRestarts = LloydIVFVectorsFormat.DEFAULT_KMEANS_RESTARTS;
     ivfKmeansIters = LloydIVFVectorsFormat.DEFAULT_KMEANS_ITERS;
+    ivfFlushIters = 5; // matches LloydIVFVectorsWriter.FLUSH_ITERS default
     ivfSoarLambda = LloydIVFVectorsFormat.DEFAULT_SOAR_LAMBDA;
     // Faiss IVF baseline defaults: 8-bit scalar-quantized IVF, nlist cells from ivfNlist, nprobe
     // from ivfNprobe -- structurally the closest Faiss analogue to the Java IVF 8-bit scalar codec.
@@ -590,6 +592,15 @@ public class KnnGraphTester implements FormatterLogger {
             throw new IllegalArgumentException("-ivfKmeansIters requires a following int");
           }
           ivfKmeansIters = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfFlushIters":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfFlushIters requires a following int");
+          }
+          ivfFlushIters = Integer.parseInt(args[++iarg]);
+          // The codec reads this as a system property, so set it here rather than plumbing it through
+          // the format constructor (it is a clustering knob, not part of the on-disk format).
+          System.setProperty("ivf.flushIters", Integer.toString(ivfFlushIters));
           break;
         case "-ivfSoarLambda":
           if (iarg == args.length - 1) {
@@ -1332,6 +1343,36 @@ public class KnnGraphTester implements FormatterLogger {
   }
 
   // static so we are forced to pass in all things that are volatile wrt indexing (if they change, it requires reindexing)
+  /**
+   * Evicts every file under {@code dir} from the OS page cache via posix_fadvise(POSIX_FADV_DONTNEED), so
+   * the next reads actually hit storage. Best-effort: a failure just leaves the cache warm.
+   */
+  private static void dropPageCache(Path dir) {
+    try (var files = Files.walk(dir)) {
+      List<Path> all = files.filter(Files::isRegularFile).toList();
+      for (Path f : all) {
+        try {
+          ProcessBuilder pb =
+              new ProcessBuilder(
+                  "python3",
+                  "-c",
+                  "import os,sys\nfd=os.open(sys.argv[1],os.O_RDONLY)\n"
+                      + "os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)\nos.close(fd)",
+                  f.toString());
+          pb.redirectErrorStream(true);
+          Process p = pb.start();
+          p.getInputStream().readAllBytes();
+          p.waitFor();
+        } catch (Exception e) {
+          // best effort per file
+        }
+      }
+      System.out.println("dropped page cache for " + all.size() + " index files under " + dir);
+    } catch (Exception e) {
+      System.out.println("WARNING: could not drop page cache: " + e);
+    }
+  }
+
   private static String formatIndexKey(IndexType indexType, int maxConn, int beamWidth,
                                        boolean useBp,
                                        boolean quantize, int quantizeBits, boolean quantizeCompress,
@@ -1402,6 +1443,47 @@ public class KnnGraphTester implements FormatterLogger {
       }
       if (ivfKmeansIters != LloydIVFVectorsFormat.DEFAULT_KMEANS_ITERS) {
         suffix.add("kmi" + ivfKmeansIters);
+      }
+      // -Divf.quantBits is the code bit-depth, which determines the ON-DISK record layout (8 => one
+      // byte/dim, 4 => nibble-packed dim/2 bytes, other => bit-plane dim*bits/8). It MUST be in the key:
+      // without it, flipping bit-depth silently reuses an index whose records the reader would then
+      // misparse. Read from the same system property the codec reads (default 8 there).
+      suffix.add("qb" + Integer.getInteger("ivf.quantBits", 8));
+      // The quantizer determines the on-disk code layout, so it belongs in the key.
+      // Lloyd iteration counts are write-time (they determine the persisted centroids) => in the key.
+      // Clustering iteration count is write-time, so it must be in the key: without it a sweep silently
+      // reuses an index clustered with a different number of passes. Read from the system property the
+      // -ivfFlushIters arg sets (this method is static); default 5 matches the codec's own default.
+      int fi = Integer.getInteger("ivf.flushIters", 5);
+      if (fi != 5) {
+        suffix.add("fi" + fi);
+      }
+      // The codec now DEFAULTS to blocksphere, so record whatever is in effect (an absent marker used to
+      // mean "coordinate-wise", which silently let a blocksphere index be reused as an osq one).
+      suffix.add("qz" + System.getProperty("ivf.quantizer", "blocksphere").toLowerCase(Locale.ROOT));
+      // Streaming-merge centroid training is WRITE-time (it determines the persisted centroids), so both
+      // knobs belong in the key — otherwise a sweep silently reuses an index trained differently.
+      int refine = Integer.getInteger("ivf.streamRefineIters", 1);
+      if (refine != 1) {
+        suffix.add("ri" + refine);
+      }
+      int sfmd = Integer.getInteger("ivf.streamFlushMinDocs", 0);
+      if (sfmd > 0) {
+        suffix.add("sf" + sfmd);
+      }
+      Integer tsc = Integer.getInteger("ivf.trainSampleCap");
+      if (tsc != null) {
+        suffix.add("tsc" + tsc);
+      }
+      // Centroid-graph build params are WRITE-time (they change the persisted routing graph, and a
+      // worse-connected graph loses recall by missing cells), so they belong in the key too.
+      Integer chm = Integer.getInteger("ivf.centroidHnswM");
+      if (chm != null) {
+        suffix.add("chm" + chm);
+      }
+      Integer chb = Integer.getInteger("ivf.centroidHnswBeamWidth");
+      if (chb != null) {
+        suffix.add("chb" + chb);
       }
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
@@ -1697,6 +1779,13 @@ public class KnnGraphTester implements FormatterLogger {
             }
           }
           log("done warmup\n");
+          // -Dknn.dropCacheAfterWarmup=true: evict the index files from the OS page cache AFTER warmup and
+          // before the timed pass. Without this the warmup (which runs every query) leaves the whole index
+          // resident, so a "cold" measurement is silently a warm one -- which invalidates any test of
+          // prefetch / async-I/O work. posix_fadvise(DONTNEED) needs no root.
+          if (Boolean.getBoolean("knn.dropCacheAfterWarmup")) {
+            dropPageCache(indexPath);
+          }
           targetReader.reset();
           startNS = System.nanoTime();
           ThreadDetails startThreadDetails = new ThreadDetails();

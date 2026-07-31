@@ -128,6 +128,19 @@ if java_bin:
   print("Using java from: %s" % java_bin)
 if "JAVA_EXE" not in globals():
   JAVA_EXE = f"{java_bin}java"
+  # KNN_RAM_CAP: run each benchmark JVM inside a cgroup-v2 memory-capped scope, for the >RAM regime test
+  # (open.md §1). The cap MUST wrap the JVM itself, not this python driver: knnPerfTest.py forks the JVM
+  # as a child, and a `systemd-run --scope` around the driver does NOT contain those forks (they land in
+  # the login session's own uncapped scope), so wrapping the driver silently measures a WARM run.
+  # `systemd-run --user --scope` needs no root -- the `memory` controller is delegated to the user slice.
+  # MemorySwapMax=0 forces reclaim to evict page cache rather than swap. The cap bounds heap + page cache
+  # together, so keep KNN_HEAP well below it or the JVM OOMs instead of paging.
+  _ram_cap = os.environ.get("KNN_RAM_CAP")
+  if _ram_cap:
+    JAVA_EXE = (
+      f"systemd-run --user --scope -p MemoryMax={_ram_cap} -p MemorySwapMax=0 --quiet {JAVA_EXE}"
+    )
+    print(f"KNN_RAM_CAP={_ram_cap}: each benchmark JVM runs in a memory-capped cgroup scope")
 if "JAVAC_EXE" not in globals():
   JAVAC_EXE = f"{java_bin}javac"
 if "JAVA_COMMAND" not in globals():

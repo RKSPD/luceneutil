@@ -11,10 +11,10 @@
 set -euo pipefail
 
 # --- config -------------------------------------------------------------------
-LUCENE_DIR="${LUCENE_DIR:-/Users/rikhil/Desktop/lucene-lshivf}"
-LUCENEUTIL_DIR=/Users/rikhil/Desktop/luceneutil
-JAVA_HOME=/Library/Java/JavaVirtualMachines/amazon-corretto-26.jdk/Contents/Home
-PYTHON=python3
+LUCENE_DIR="${LUCENE_DIR:-/local/home/rikhil/vectordb/lucene}"
+LUCENEUTIL_DIR=/local/home/rikhil/vectordb/luceneutil
+JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/amazon-corretto-25.0.4.7.1-linux-aarch64}"
+PYTHON="${PYTHON:-$LUCENEUTIL_DIR/.venv/bin/python}"
 RUNS="${1:-1}"
 # JVM heap cap for the search/index JVM (-Xms/-Xmx), read by constants.py. Override per-run:
 #   KNN_HEAP=1g ./run_knn_bench.sh   (cap below index size to force the disk/off-heap path -- findings §20)
@@ -34,9 +34,17 @@ cd "$LUCENE_DIR"
 # --- 2. compile the knn harness against the fresh jars ------------------------
 echo "=== [2/4] compiling knn harness in $LUCENEUTIL_DIR ==="
 cd "$LUCENEUTIL_DIR"
-./gradlew compileKnn > /tmp/knn-compile.log 2>&1 \
-  && echo "compileKnn OK" \
-  || { echo "compileKnn FAILED -- last 30 lines:"; tail -n 30 /tmp/knn-compile.log; exit 1; }
+# Gradle intermittently reports "Could not store compilation result" AFTER javac has already written
+# the classes (its incremental-analysis snapshot fails, not the compile). That is not a real failure, so
+# retry once: the second run sees the classes as UP-TO-DATE and succeeds. Only bail if it still fails.
+if ./gradlew compileKnn > /tmp/knn-compile.log 2>&1; then
+  echo "compileKnn OK"
+elif grep -q "Could not store compilation result" /tmp/knn-compile.log \
+     && ./gradlew compileKnn > /tmp/knn-compile.log 2>&1; then
+  echo "compileKnn OK (after retry past a Gradle snapshot-store hiccup)"
+else
+  echo "compileKnn FAILED -- last 30 lines:"; tail -n 30 /tmp/knn-compile.log; exit 1
+fi
 
 # empty dir satisfies a knnPerfTest.py preflight classpath check (real classes live in ./build)
 mkdir -p "$LUCENEUTIL_DIR/src/main/build/classes/java/main"

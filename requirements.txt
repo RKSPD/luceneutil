@@ -1,6 +1,14 @@
 # used by knnPerfTest
 numpy==2.2.3
 
+# used by download_cohere_v3_en.py / initial_setup.py --build-large-vecs, to read the HF parquet shards.
+# PINNED, do NOT bump blindly: pyarrow 25.0.0 mis-decodes the RLE_DICTIONARY-encoded float 'emb'
+# column in the Cohere v3 shards -- it silently substitutes earlier dictionary values, so vectors come
+# out with ~0.5 norms instead of unit norm and DIFFER between batch sizes. 21.0.0 and 18.1.0 both
+# decode correctly (byte-exact vs the HF rows API). download_cohere_v3_en.py asserts unit norm at
+# startup, so a bad version fails loudly rather than producing a silently corrupt 170GB corpus.
+pyarrow==21.0.0
+
 # used by segments-to-html
 graphviz==0.20.3
 intervaltree==3.1.0

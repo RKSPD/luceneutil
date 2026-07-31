@@ -126,6 +126,45 @@ IVF_ADAPTIVE_NPROBE_MARGIN = None
 # (select is cheap vs the posting scan). None/1.0 => beam == nprobe (old behavior). Search-time only
 # (-Dlloyd.beamFactor), so a factor sweep reuses ONE cached index. Try 1.0/1.5/2.0/3.0.
 LLOYD_BEAM_FACTOR = float(os.environ["LLOYD_BEAM_FACTOR"]) if os.environ.get("LLOYD_BEAM_FACTOR") else None
+# LLOYD_SCORE_IN_PLACE=1 => -Dlloyd.scoreInPlace=true: in the posting scan, score the doc code where
+# it already sits in the record buffer instead of System.arraycopy-ing it into a scratch array first
+# (VectorUtil.int4DotProductSinglePackedAt / uint8DotProductAt). Same kernel, same integer dot, so
+# scores are BIT-IDENTICAL: same recall, same index, latency only. SEARCH-TIME only, so an A/B reuses
+# ONE cached index. Measured on Graviton3 (SVE 256-bit, dim=1024): 4-bit 55.7->48.0 ns/doc scan.
+LLOYD_SCORE_IN_PLACE = os.environ.get("LLOYD_SCORE_IN_PLACE") == "1"
+# LLOYD_PREFETCH_CELLS=1 => -Dlloyd.prefetchCells=true: Stage A of the >RAM I/O plan (open.md §1).
+# Batch-prefetches each probed cell's sketch + code run before the scan, instead of faulting one doc's
+# sketch at a time (~100k serialized faults/query at nlist=2000/spill=2/nprobe=100). Advisory madvise,
+# so recall is unchanged; only helps when reads MISS the page cache (cold-cache / >RAM), no-op when warm.
+# SEARCH-TIME only => an A/B reuses ONE cached index.
+LLOYD_PREFETCH_CELLS = os.environ.get("LLOYD_PREFETCH_CELLS") == "1"
+# IVF_STREAM_REFINE_ITERS: full-corpus Lloyd refinement passes in the STREAMING merge (0 = sample-only,
+# the old behavior). The streaming merge no longer has to hold every vector in RAM, so centroids need not
+# be limited to the ≤trainSampleCap subsample: each pass streams all vectors and accumulates per-cell sums
+# (resident cost nlist*dim floats, independent of N). WRITE-time => in the index key, so a sweep reindexes.
+IVF_STREAM_REFINE_ITERS = os.environ.get("IVF_STREAM_REFINE_ITERS")
+# IVF_STREAM_FLUSH_MIN_DOCS: above this many docs in a segment's field buffer, FLUSH stops holding
+# full-dim floats and instead quantizes each vector on arrival into a temp record file (data-blind zero-mu
+# codes make this safe), clustering from that file. Resident RAM becomes O(1)/doc instead of ~4 KB/doc.
+# 0/unset = previous heap-buffered behavior. WRITE-time (changes centroids) => in the index key.
+IVF_STREAM_FLUSH_MIN_DOCS = os.environ.get("IVF_STREAM_FLUSH_MIN_DOCS")
+# IVF_TRAIN_SAMPLE_CAP: cap on the training subsample used to seed streaming-merge centroids. This is
+# only the SEED -- streamRefineIters then runs full-corpus Lloyd over every doc -- but the seed still has
+# to be non-degenerate: at nlist=100k the default 200k cap leaves 2 sample vectors per centroid, so raise
+# it with nlist to keep a sane vectors/centroid ratio. Held as float[sample][dim] (~4 KB each), so a 2M
+# sample is ~8 GiB resident: raise KNN_HEAP alongside it.
+IVF_TRAIN_SAMPLE_CAP = os.environ.get("IVF_TRAIN_SAMPLE_CAP")
+# Centroid-graph (routing among the nlist centroids) build params. The defaults M=16/beamWidth=16 were
+# tuned at nlist=2000; a 100k-centroid graph needs more connectivity or routing recall drops, which shows
+# up as missed cells (direct recall loss), not as an error. WRITE-time => in the index key.
+IVF_CENTROID_HNSW_M = os.environ.get("IVF_CENTROID_HNSW_M")
+IVF_CENTROID_HNSW_BEAM_WIDTH = os.environ.get("IVF_CENTROID_HNSW_BEAM_WIDTH")
+# Beam ef for the per-doc spill fan-out. With IVF_BEAM_SPILL=1 the SOAR pool is max(4*spillPerDoc, 64)
+# instead of ALL nlist, which is what makes spill affordable at large nlist (the full scan is
+# O(count*nlist*dim) -- projected ~33 h at 40M x nlist=100k).
+IVF_SPILL_EF_SEARCH = os.environ.get("IVF_SPILL_EF_SEARCH")
+# Per-cell cap (bytes) on the CODE run hinted by Stage A; 0 disables code prefetch (sketch only).
+LLOYD_PREFETCH_CODE_MAX_BYTES = os.environ.get("LLOYD_PREFETCH_CODE_MAX_BYTES")
 # LLOYD_CEIL_AUDIT=1 => -Dlloyd.ceilAudit=true: per-query, the reader exact-scans its own code table
 # for the achievable top-k, then reports how the NN docs' primary cells scatter across the centroid-
 # distance frontier (meanDistinctNNCells, meanMaxNNCellRank). Diagnostic only; slow (full scan/query).
@@ -173,7 +212,9 @@ LLOYD_BRUTE_SEARCH = os.environ.get("LLOYD_BRUTE_SEARCH") == "1"
 LLOYD_SKETCH_SCAN = os.environ.get("LLOYD_SKETCH_SCAN", "1") == "1"
 # IVF_QUANT_BITS: rerank code bit-depth (default 8). 5 => 5-bit codes (§10M, 640B/doc). Write+read side.
 # DEFAULT 5 for the §10N operating point (5-bit bit-plane codes). Override e.g. IVF_QUANT_BITS=8 for int8.
-IVF_QUANT_BITS = os.environ.get("IVF_QUANT_BITS", "5")
+# Default 4: the shipping config is 4-bit Block-Sphere codes (§12), 512 B/doc. 5-bit uses the bit-plane
+# layout, which has no SIMD path (planeDot is a bit-scan), so it is slow and not the operating point.
+IVF_QUANT_BITS = os.environ.get("IVF_QUANT_BITS", "4")
 # IVF_BEAM_SPILL=1 => -Divf.beamSpill=true: ADAPTIVE HNSW-beam spilling (§11). When ivfSpillBits>0 the
 # writer routes each doc through the centroid HNSW beam for its 1+spillBits nearest cells, then keeps only
 # the leading cells within IVF_SPILL_MARGIN× the nearest cell's distance — boundary docs spill, interior
@@ -284,7 +325,9 @@ def advise_will_need(file_name, offset_bytes=0, length_bytes=0):
 # you may want to modify the following settings:
 
 # uses CPUTime sampling (newly available/experimental in Java 25, seems to work on the tasks benchmark)
-DO_PROFILING = False
+# KNN_JFR=1 enables it without editing this file (useful for one-off profiling runs, e.g. attributing
+# >RAM latency between CPU and I/O wait).
+DO_PROFILING = os.environ.get("KNN_JFR") == "1"
 DO_PS = True
 # vmstat is Linux-only; disable when the executable is unavailable (e.g. macOS)
 DO_VMSTAT = benchUtil.VMSTAT_PATH is not None
@@ -424,7 +467,7 @@ NOISY = True
 
 # test parameters. This script will run KnnGraphTester on every combination of these parameters
 PARAMS = {
-  "ndoc": (1_000_000,),
+  "ndoc": (39_767_748,),
   "indexType": ("lloyd_ivf",),
   # IVF params (ignored for hnsw runs)
   # Target ~50 docs/Voronoi cell: nlist = ndoc / 50 = 1_000_000 / 50 = 20_000.
@@ -440,7 +483,7 @@ PARAMS = {
   # nearest cells. nlist is write-time -> each value reindexes.
   # Target operating point: coverage law says 0.95@nprobe=20 needs nlist~40 (big ~25k-doc cells).
   # Per-cell navigable graph makes searching those big cells cheap. nlist is write-time -> reindex.
-  "ivfNlist": (500,),
+  "ivfNlist": (100_000,),
   # nprobe scans the same corpus FRACTION as a well-tuned high-nlist run (~1.3% of cells), which at
   # 50 docs/cell means ~50*nprobe docs visited. Light (ScaNN-style) spilling instead of the heavy
   # spillBits=30 exact-SOAR tax; the larger nprobe recovers the coverage.
@@ -448,7 +491,7 @@ PARAMS = {
   # cached index serves this whole sweep. nprobe=256 gave ~0.86 recall; sweeping up to reach ~0.95.
   # hier_ivf: nprobe is a pure search-time scan budget (reader honors -Dhier.nprobe), so this whole
   # sweep reuses ONE cached index. At nlist=200 (~5000 docs/coarse cell) probe ~10-20 coarse cells.
-  "ivfNprobe": (30, 40),
+  "ivfNprobe": (40, 55, 70, 90, 120),
   # hier_ivf only: subNlist sub-centroids per coarse cell (WRITE-time → in the index key, a sweep
   # reindexes). subNprobe sub-cells scanned per probed cell (SEARCH-time → reader honors
   # -Dhier.subNprobe, reuses the cached index). At subNlist=25 each sub-cell holds ~200 docs;
@@ -464,7 +507,14 @@ PARAMS = {
   # the merge skips the per-doc O(nlist*dim) spill-select scan entirely — that scan dominated merge
   # time. Recall coverage that spilling would have bought is instead recovered by scanning more cells
   # per query via the (adaptive) nprobe above.
-  "ivfSpillBits": (2,),
+  # Lloyd iterations at FLUSH (random seeds, no donor to warm-start from). Iteration 1 only moves the
+  # centroids off their random start, so a single pass leaves the partition far from converged; the extra
+  # passes are localized reassignment (O(count*M), not O(count*nlist)) plus a PARALLEL centroid recompute,
+  # so 5 costs only ~+5% index time. WRITE-time (it determines the persisted centroids) => in the index
+  # key, so each value reindexes. Goes hand-in-hand with ivfSpillBits: better-converged centroids make
+  # each spill copy land in a more useful cell.
+  "ivfFlushIters": (5,),
+  "ivfSpillBits": (3,),
   # SOAR is a spill-selection method; no-op when spillBits=0.
   "ivfSoarLambda": (1.0,),
   # hier_ivf: rerankFactor is SEARCH-time (reader honors -Dhier.rerankFactor); pool = factor*topK
@@ -2247,32 +2297,45 @@ def run_knn_benchmark(checkout, values, log_path):
   # doc_vectors = "%s/lucene_util/tasks/enwiki-20120502-lines-1k-100d.vec" % constants.BASE_DIR
   # query_vectors = "%s/lucene_util/tasks/vector-task-100d.vec" % constants.BASE_DIR
 
-  # Cohere Wikipedia en vectors - see cohere-v3-README.txt -- download your copy with "initial_setup.py -download"
+  # Cohere Wikipedia en vectors - see cohere-v3-README.txt. Set False for the older 768d v2 corpus.
   v3 = True
 
-  # Read ONLY from the large Cohere-v3 MULTILINGUAL .vec built by
-  #   initial_setup.py --build-large-vecs <N>
-  # (same 1024d unit-norm distribution as the bundled 1M sample, so the frozen PCA/ITQ basis stays
-  # comparable). LARGE_VEC_DOCS is the N you built; ndoc in PARAMS must be <= N. The query set stays
-  # the bundled 200K (same distribution). This is the >RAM regime where this codec is meant to win and
-  # where disk I/O finally matters (see findings.md §6/§13); the bundled 1M sample was HNSW's best case
-  # (fit in RAM). To go back to the 1M sample, point doc_vectors at the ...first1M.vec file.
-  LARGE_VEC_DOCS = 100_000_000
-
+  # The FULL English Cohere-v3 Wikipedia corpus: 41,488,110 passages x 1024d unit-norm float32
+  # (~170GB), downloaded straight from HuggingFace by
+  #   python src/python/download_cohere_v3_en.py --data-dir $BASE_DIR/data
+  # then shuffled to the 'scattered' distribution (adjacent Wikipedia passages must not stay adjacent,
+  # or they land in the same IVF/LSH bucket and inflate recall):
+  #   python src/python/shuffle_vecs.py <docs.en-full.vec> <docs.en-full-scattered.vec> --dim 1024
+  # Same 1024d unit-norm distribution as the bundled 1M sample, so a frozen PCA/ITQ basis stays
+  # comparable. This is the >RAM regime where this codec is meant to win and where disk I/O finally
+  # matters (findings.md §6/§13); the bundled 1M sample was HNSW's best case (fit in RAM).
+  #
+  # Queries are held out by the downloader at the ARTICLE level (1-in-24 wiki_ids by hash, ~1.7M
+  # vectors), matching the bundled corpus's design: docs and queries share no vector AND no article,
+  # so a query's own sibling paragraphs aren't sitting in the index as trivial top-1 hits.
   if v3:
     dim = 1024
-    #doc_vectors = f"/Users/rikhil/Desktop/data/cohere-v3-multilingual-1024d.docs.{LARGE_VEC_DOCS}.vec"
-    #doc_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.docs.first1M.vec"
-    # 20M English Wikipedia vectors (built via --build-large-vecs 20000000, then shuffled to the
-    # 'scattered' distribution by shuffle_vecs.py). ~82GB on disk -> the >RAM regime (findings §13/§20).
-    # ndoc in PARAMS must be <= 20_000_000.
-    doc_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.docs.20M.vec"
+    data_dir = f"{constants.BASE_DIR}/data"
+    # Prefer the shuffled ('scattered') corpus; fall back to corpus order if it hasn't been built yet.
+    # ndoc in PARAMS must be <= the doc count (~39.7M: 41,488,110 total minus the ~1.7M query holdout);
+    # the ndoc-vs-file-size check below enforces this exactly.
+    doc_vectors = f"{data_dir}/cohere-v3-wikipedia-en-scattered-1024d.docs.en-full.vec"
     if not os.path.exists(doc_vectors):
+      unshuffled = f"{data_dir}/cohere-v3-wikipedia-en-1024d.docs.en-full.vec"
+      if not os.path.exists(unshuffled):
+        raise RuntimeError(
+          f"full-English doc vectors not found: {doc_vectors}\n"
+          f"  download them first:  python src/python/download_cohere_v3_en.py --data-dir {data_dir}\n"
+          f"  then shuffle:         python src/python/shuffle_vecs.py {unshuffled} {doc_vectors} --dim {dim}"
+        )
+      print(f"WARNING: using CORPUS-ORDER doc vectors ({unshuffled}).\n  Adjacent Wikipedia passages share a bucket -> recall is OPTIMISTIC. Shuffle for honest numbers:\n    python src/python/shuffle_vecs.py {unshuffled} {doc_vectors} --dim {dim}")
+      doc_vectors = unshuffled
+    query_vectors = f"{data_dir}/cohere-v3-wikipedia-en-1024d.queries.1in24-articles.vec"
+    if not os.path.exists(query_vectors):
       raise RuntimeError(
-        f"large doc vectors not found: {doc_vectors}\n"
-        f"  build them first:  python src/python/initial_setup.py --build-large-vecs {LARGE_VEC_DOCS}"
+        f"query vectors not found: {query_vectors}\n"
+        f"  download them first:  python src/python/download_cohere_v3_en.py --data-dir {data_dir}"
       )
-    query_vectors = "/Users/rikhil/Desktop/data/cohere-v3-wikipedia-en-scattered-1024d.queries.first200K.vec"
   else:
     dim = 768
     doc_vectors = f"/lucenedata/enwiki/cohere-wikipedia-docs-{dim}d.vec"
@@ -2349,6 +2412,38 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f"-Divf.adaptiveNprobeMargin={IVF_ADAPTIVE_NPROBE_MARGIN}"]
   if LLOYD_BEAM_FACTOR is not None:
     cmd += [f"-Dlloyd.beamFactor={LLOYD_BEAM_FACTOR}"]
+  if LLOYD_SCORE_IN_PLACE:
+    cmd += ["-Dlloyd.scoreInPlace=true"]
+  if LLOYD_PREFETCH_CELLS:
+    cmd += ["-Dlloyd.prefetchCells=true"]
+  if os.environ.get("LLOYD_URING_SKETCH_SCAN") == "1":
+    cmd += ["-Dlloyd.uringSketchScan=true"]
+  if os.environ.get("LLOYD_URING_DEBUG") == "1":
+    cmd += ["-Dlloyd.uringDebug=true"]
+  if os.environ.get("LLOYD_NO_HEAP_SKIP") == "1":
+    cmd += ["-Dlloyd.noHeapSkip=true"]
+  if os.environ.get("KNN_DROP_CACHE_AFTER_WARMUP") == "1":
+    cmd += ["-Dknn.dropCacheAfterWarmup=true"]
+  if os.environ.get("LLOYD_CEIL_K"):
+    cmd += [f'-Dlloyd.ceilK={os.environ["LLOYD_CEIL_K"]}']
+  if IVF_STREAM_REFINE_ITERS is not None:
+    cmd += [f"-Divf.streamRefineIters={IVF_STREAM_REFINE_ITERS}"]
+  if IVF_CENTROID_HNSW_M is not None:
+    cmd += [f"-Divf.centroidHnswM={IVF_CENTROID_HNSW_M}"]
+  if IVF_CENTROID_HNSW_BEAM_WIDTH is not None:
+    cmd += [f"-Divf.centroidHnswBeamWidth={IVF_CENTROID_HNSW_BEAM_WIDTH}"]
+  if IVF_SPILL_EF_SEARCH is not None:
+    cmd += [f"-Divf.spillEfSearch={IVF_SPILL_EF_SEARCH}"]
+  if os.environ.get("IVF_QUANTIZER"):
+    cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
+  if IVF_STREAM_FLUSH_MIN_DOCS is not None:
+    cmd += [f"-Divf.streamFlushMinDocs={IVF_STREAM_FLUSH_MIN_DOCS}"]
+  if IVF_TRAIN_SAMPLE_CAP is not None:
+    cmd += [f"-Divf.trainSampleCap={IVF_TRAIN_SAMPLE_CAP}"]
+  if os.environ.get("LLOYD_PREFETCH_AUDIT") == "1":
+    cmd += ["-Dlloyd.prefetchAudit=true"]
+  if LLOYD_PREFETCH_CODE_MAX_BYTES is not None:
+    cmd += [f"-Dlloyd.prefetchCodeMaxBytes={LLOYD_PREFETCH_CODE_MAX_BYTES}"]
   if LLOYD_CEIL_AUDIT:
     cmd += ["-Dlloyd.ceilAudit=true"]
   if LLOYD_CEIL_DIR:
@@ -2422,12 +2517,26 @@ def run_knn_benchmark(checkout, values, log_path):
   if NOISY:
     print_run_summary(values)
 
-  smell_vectors(dim, doc_vectors, "docs")
-  smell_vectors(dim, query_vectors, "queries")
+  # KNN_SKIP_SMELL=1: skip the vector-distribution / intrinsic-dim analysis. It random-reads a large
+  # sample straight out of the (162 GB) docs file, which under a >RAM memory cap thrashes for many
+  # minutes before the benchmark even starts -- and it tells us nothing about search latency.
+  if os.environ.get("KNN_SKIP_SMELL") == "1":
+    print("KNN_SKIP_SMELL=1: skipping smell_vectors (vector distribution / intrinsic-dim analysis)")
+  else:
+    smell_vectors(dim, doc_vectors, "docs")
+    smell_vectors(dim, query_vectors, "queries")
 
   n_doc_check = max(values.get("ndoc", (1000,)))
   n_query_check = max(values.get("nquery", (1000,)))
   query_start_check = min(values.get("queryStartIndex", (0,)))
+
+  # Fail fast if PARAMS asks for more vectors than the source files actually hold: KnnGraphTester would
+  # otherwise read past EOF (or silently index fewer docs than the run is labelled with).
+  for label, path, needed in (("ndoc", doc_vectors, n_doc_check), ("nquery+queryStartIndex", query_vectors, query_start_check + n_query_check)):
+    available = os.path.getsize(path) // (dim * 4)
+    if needed > available:
+      raise RuntimeError(f"{label}={needed:,} exceeds the {available:,} vectors in {path}")
+
   encoding_check = values.get("encoding", ("float32",))[0]
   if CHECK_VECTOR_OVERLAP:
     knnExactNN.check_vector_overlap(
@@ -3233,6 +3342,38 @@ def build_java_base_cmd(checkout):
     cmd += [f"-Divf.adaptiveNprobeMargin={IVF_ADAPTIVE_NPROBE_MARGIN}"]
   if LLOYD_BEAM_FACTOR is not None:
     cmd += [f"-Dlloyd.beamFactor={LLOYD_BEAM_FACTOR}"]
+  if LLOYD_SCORE_IN_PLACE:
+    cmd += ["-Dlloyd.scoreInPlace=true"]
+  if LLOYD_PREFETCH_CELLS:
+    cmd += ["-Dlloyd.prefetchCells=true"]
+  if os.environ.get("LLOYD_URING_SKETCH_SCAN") == "1":
+    cmd += ["-Dlloyd.uringSketchScan=true"]
+  if os.environ.get("LLOYD_URING_DEBUG") == "1":
+    cmd += ["-Dlloyd.uringDebug=true"]
+  if os.environ.get("LLOYD_NO_HEAP_SKIP") == "1":
+    cmd += ["-Dlloyd.noHeapSkip=true"]
+  if os.environ.get("KNN_DROP_CACHE_AFTER_WARMUP") == "1":
+    cmd += ["-Dknn.dropCacheAfterWarmup=true"]
+  if os.environ.get("LLOYD_CEIL_K"):
+    cmd += [f'-Dlloyd.ceilK={os.environ["LLOYD_CEIL_K"]}']
+  if IVF_STREAM_REFINE_ITERS is not None:
+    cmd += [f"-Divf.streamRefineIters={IVF_STREAM_REFINE_ITERS}"]
+  if IVF_CENTROID_HNSW_M is not None:
+    cmd += [f"-Divf.centroidHnswM={IVF_CENTROID_HNSW_M}"]
+  if IVF_CENTROID_HNSW_BEAM_WIDTH is not None:
+    cmd += [f"-Divf.centroidHnswBeamWidth={IVF_CENTROID_HNSW_BEAM_WIDTH}"]
+  if IVF_SPILL_EF_SEARCH is not None:
+    cmd += [f"-Divf.spillEfSearch={IVF_SPILL_EF_SEARCH}"]
+  if os.environ.get("IVF_QUANTIZER"):
+    cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
+  if IVF_STREAM_FLUSH_MIN_DOCS is not None:
+    cmd += [f"-Divf.streamFlushMinDocs={IVF_STREAM_FLUSH_MIN_DOCS}"]
+  if IVF_TRAIN_SAMPLE_CAP is not None:
+    cmd += [f"-Divf.trainSampleCap={IVF_TRAIN_SAMPLE_CAP}"]
+  if os.environ.get("LLOYD_PREFETCH_AUDIT") == "1":
+    cmd += ["-Dlloyd.prefetchAudit=true"]
+  if LLOYD_PREFETCH_CODE_MAX_BYTES is not None:
+    cmd += [f"-Dlloyd.prefetchCodeMaxBytes={LLOYD_PREFETCH_CODE_MAX_BYTES}"]
   if LLOYD_CEIL_AUDIT:
     cmd += ["-Dlloyd.ceilAudit=true"]
   if LLOYD_CEIL_DIR:
