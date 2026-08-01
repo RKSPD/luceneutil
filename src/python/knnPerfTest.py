@@ -621,6 +621,33 @@ PARAMS = {
 }
 
 
+# Env overrides for the knobs a >RAM sweep varies between its BUILD and SEARCH phases, so one PARAMS
+# block serves both without hand-editing between them (an edit mid-sweep is how a "40M spill=10" run
+# silently becomes a 1M spill=2 one). Each parses a comma-separated list into the tuple PARAMS wants.
+#   KNN_NDOC=39767748  KNN_NLIST=100000  KNN_SPILL_BITS=10  KNN_NPROBE=40,55,70,90,120
+# ndoc/nlist/spillBits are WRITE-time (in the index key => reindex per value); nprobe is search-time,
+# so ONE cached index serves the whole nprobe sweep.
+def _env_int_tuple(name):
+  raw = os.environ.get(name)
+  if not raw:
+    return None
+  return tuple(int(x) for x in raw.replace(" ", "").split(",") if x)
+
+
+for _env_name, _param in (
+  ("KNN_NDOC", "ndoc"),
+  ("KNN_NLIST", "ivfNlist"),
+  ("KNN_SPILL_BITS", "ivfSpillBits"),
+  ("KNN_NPROBE", "ivfNprobe"),
+  ("KNN_NQUERY", "nquery"),
+  ("KNN_FLUSH_ITERS", "ivfFlushIters"),
+):
+  _vals = _env_int_tuple(_env_name)
+  if _vals:
+    PARAMS[_param] = _vals
+    print(f"{_env_name}: {_param} = {_vals}")
+
+
 OUTPUT_HEADERS = [
   "recall",
   "latency(ms)",
@@ -2422,6 +2449,20 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += ["-Dlloyd.prefetchCells=true"]
   if os.environ.get("LLOYD_URING_SKETCH_SCAN") == "1":
     cmd += ["-Dlloyd.uringSketchScan=true"]
+  # Stage D: batch+coalesce the rerank code-record reads (the component that dominates cold reads --
+  # Stage C only batches the sketch runs). Reader-side; bit-identical results.
+  if os.environ.get("LLOYD_URING_RERANK") == "1":
+    cmd += ["-Dlloyd.uringRerank=true"]
+  # Stage E: dispatch each cell's read as it is selected and scan cells as their bytes land, so reads
+  # overlap the Hamming scan instead of running as a separate blocking phase.
+  if os.environ.get("LLOYD_URING_PIPELINE") == "1":
+    cmd += ["-Dlloyd.uringPipeline=true"]
+  if os.environ.get("LLOYD_PIPELINE_DEPTH") is not None:
+    cmd += [f"-Dlloyd.pipelineDepth={os.environ['LLOYD_PIPELINE_DEPTH']}"]
+  if os.environ.get("LLOYD_RERANK_AUDIT") == "1":
+    cmd += ["-Dlloyd.rerankAudit=true"]
+  if os.environ.get("LLOYD_RERANK_COALESCE_GAP") is not None:
+    cmd += [f"-Dlloyd.rerankCoalesceGap={os.environ['LLOYD_RERANK_COALESCE_GAP']}"]
   if os.environ.get("LLOYD_URING_DEBUG") == "1":
     cmd += ["-Dlloyd.uringDebug=true"]
   if os.environ.get("LLOYD_NO_HEAP_SKIP") == "1":
@@ -2444,6 +2485,13 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f"-Divf.spillEfSearch={IVF_SPILL_EF_SEARCH}"]
   if os.environ.get("IVF_QUANTIZER"):
     cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
+  # Block size p for -Divf.quantizer=blocksphere. Write-time (it sets the on-disk bytes/block), and the
+  # codec default is already 2, so an unset value happens to give p=2 today -- pass it explicitly anyway
+  # so the run does not silently depend on that default. NOTE: blockP is NOT in the index key (only
+  # qz<quantizer> is), so switching p against a cached index would misparse every record; clear
+  # knn-reuse/indices when changing it. run_40m_p2_sweep.sh enforces this with a .blockP stamp.
+  if os.environ.get("IVF_BLOCK_P"):
+    cmd += [f'-Divf.blockP={os.environ["IVF_BLOCK_P"]}']
   if IVF_STREAM_FLUSH_MIN_DOCS is not None:
     cmd += [f"-Divf.streamFlushMinDocs={IVF_STREAM_FLUSH_MIN_DOCS}"]
   if IVF_TRAIN_SAMPLE_CAP is not None:
@@ -3356,6 +3404,20 @@ def build_java_base_cmd(checkout):
     cmd += ["-Dlloyd.prefetchCells=true"]
   if os.environ.get("LLOYD_URING_SKETCH_SCAN") == "1":
     cmd += ["-Dlloyd.uringSketchScan=true"]
+  # Stage D: batch+coalesce the rerank code-record reads (the component that dominates cold reads --
+  # Stage C only batches the sketch runs). Reader-side; bit-identical results.
+  if os.environ.get("LLOYD_URING_RERANK") == "1":
+    cmd += ["-Dlloyd.uringRerank=true"]
+  # Stage E: dispatch each cell's read as it is selected and scan cells as their bytes land, so reads
+  # overlap the Hamming scan instead of running as a separate blocking phase.
+  if os.environ.get("LLOYD_URING_PIPELINE") == "1":
+    cmd += ["-Dlloyd.uringPipeline=true"]
+  if os.environ.get("LLOYD_PIPELINE_DEPTH") is not None:
+    cmd += [f"-Dlloyd.pipelineDepth={os.environ['LLOYD_PIPELINE_DEPTH']}"]
+  if os.environ.get("LLOYD_RERANK_AUDIT") == "1":
+    cmd += ["-Dlloyd.rerankAudit=true"]
+  if os.environ.get("LLOYD_RERANK_COALESCE_GAP") is not None:
+    cmd += [f"-Dlloyd.rerankCoalesceGap={os.environ['LLOYD_RERANK_COALESCE_GAP']}"]
   if os.environ.get("LLOYD_URING_DEBUG") == "1":
     cmd += ["-Dlloyd.uringDebug=true"]
   if os.environ.get("LLOYD_NO_HEAP_SKIP") == "1":
@@ -3378,6 +3440,13 @@ def build_java_base_cmd(checkout):
     cmd += [f"-Divf.spillEfSearch={IVF_SPILL_EF_SEARCH}"]
   if os.environ.get("IVF_QUANTIZER"):
     cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
+  # Block size p for -Divf.quantizer=blocksphere. Write-time (it sets the on-disk bytes/block), and the
+  # codec default is already 2, so an unset value happens to give p=2 today -- pass it explicitly anyway
+  # so the run does not silently depend on that default. NOTE: blockP is NOT in the index key (only
+  # qz<quantizer> is), so switching p against a cached index would misparse every record; clear
+  # knn-reuse/indices when changing it. run_40m_p2_sweep.sh enforces this with a .blockP stamp.
+  if os.environ.get("IVF_BLOCK_P"):
+    cmd += [f'-Divf.blockP={os.environ["IVF_BLOCK_P"]}']
   if IVF_STREAM_FLUSH_MIN_DOCS is not None:
     cmd += [f"-Divf.streamFlushMinDocs={IVF_STREAM_FLUSH_MIN_DOCS}"]
   if IVF_TRAIN_SAMPLE_CAP is not None:
