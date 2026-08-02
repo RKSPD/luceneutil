@@ -204,6 +204,13 @@ if [ "$PHASE" = "both" ] || [ "$PHASE" = "search" ]; then
   export KNN_HEAP="${KNN_SEARCH_HEAP:-8g}"
   export BALLOON_HEAP_HEADROOM=12
   export KNN_CLEAR_CACHE=0          # REUSE the built index; do NOT rebuild per nprobe
+  # REQUIRED for a genuinely cold row, and the reason is subtle enough that it was missed twice:
+  # the balloon + fadvise below evict the index, but the HARNESS then runs a full warmup over every query
+  # BEFORE the timed pass, which re-faults the ~13 MB/query working set into whatever cache the balloon
+  # left. Measured without this: 13.5 ms at avgCpuCount 0.997 -- pure CPU, zero I/O stall, i.e. a WARM
+  # number wearing a cold run's clothes (benchmarks.md §15, and §13 bug 2 in a new costume). This flag
+  # evicts AFTER warmup and immediately before timing, which is the only ordering that yields a cold pass.
+  export KNN_DROP_CACHE_AFTER_WARMUP="${KNN_DROP_CACHE_AFTER_WARMUP:-1}"
   export KNN_NQUERY="${KNN_NQUERY:-1000}"
 
   echo "=== inflating balloon to leave ~${TARGET_CACHE} GiB for page cache ===" | tee -a "$RESULTS"
