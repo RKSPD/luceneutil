@@ -264,7 +264,12 @@ PY
   # only on Stage C would false-alarm the moment the pipeline is on (and a guard that cries wolf gets
   # ignored, which defeats its whole purpose).
   if [ "${LLOYD_URING_SKETCH_SCAN}" = "1" ] || [ "${LLOYD_URING_PIPELINE}" = "1" ]; then
-    ENGAGED=$(tail -n +"$SEARCH_START_LINE" "$RESULTS" | grep -cE "\[lloyd uring\] Stage-(C|E)")
+    # Match any "[lloyd uring] ... engaged" line, not the old "Stage-C engaged" wording: the reader now
+    # prints "[lloyd uring] engaged on thread <t> usingUring= O_DIRECT= depth= file=" and the Stage-C/E
+    # spelling is gone. Keying on the old text made this guard fire on a run where the ring HAD engaged
+    # (usingUring=true depth=128) and discard a valid result -- a false alarm is as damaging as a miss,
+    # because a guard that cries wolf gets ignored, which is what this guard's own rationale warns about.
+    ENGAGED=$(tail -n +"$SEARCH_START_LINE" "$RESULTS" | grep -cE "\[lloyd uring\].*(engaged|Stage-(C|E))")
     if [ "$ENGAGED" -eq 0 ]; then
       echo "FATAL: async I/O was requested but the reader never printed a Stage-C/Stage-E engagement line." | tee -a "$RESULTS"
       echo "       Every latency row above is the UNACCELERATED per-doc path -- do NOT record them as" | tee -a "$RESULTS"
