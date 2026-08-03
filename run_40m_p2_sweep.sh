@@ -196,7 +196,14 @@ if [ "$PHASE" = "both" ] || [ "$PHASE" = "search" ]; then
 
   # Target cache = ~1/4 of the index, so the working set genuinely exceeds RAM but a realistic partial
   # cache remains. Floor of 8 GiB so the JVM + kernel are not starved into thrashing.
-  TARGET_CACHE=$(( INDEX_GIB / 4 ))
+  #
+  # WARNING: sizing off the ON-DISK total OVERSHOOTS badly at quantBits=4. Only the code+sketch tables
+  # are ever touched by a query -- the harness reports that as vec_RAM, measured 39,442 MB (~38.5 GiB)
+  # for this index -- while the 150 GiB on disk is mostly spillBits=10 record DUPLICATION that no query
+  # reads. So INDEX_GIB/4 = 37 GiB is ~= the entire touched set: the balloon leaves room for all of it,
+  # the pass re-warms itself, and the "cold" row is a WARM number (the §13/§15 trap in yet another
+  # costume). Size against vec_RAM, not du. TARGET_CACHE_GIB overrides for that.
+  TARGET_CACHE="${TARGET_CACHE_GIB:-$(( INDEX_GIB / 4 ))}"
   [ "$TARGET_CACHE" -lt 8 ] && TARGET_CACHE=8
   # Search heap is small on purpose: the code/sketch tables are read through mmap (§12.6, the reader no
   # longer slurps), so heap does NOT need to hold them -- and every GiB of heap is a GiB the page cache
