@@ -214,11 +214,13 @@ LLOYD_BRUTE_SEARCH = os.environ.get("LLOYD_BRUTE_SEARCH") == "1"
 # DEFAULT ON: the §10N shippable operating point (cell-order 5-bit sketch-scan, 0.944 / 12.3 ms). Set
 # LLOYD_SKETCH_SCAN=0 to force it off.
 LLOYD_SKETCH_SCAN = os.environ.get("LLOYD_SKETCH_SCAN", "1") == "1"
-# IVF_QUANT_BITS: rerank code bit-depth (default 8). 5 => 5-bit codes (§10M, 640B/doc). Write+read side.
-# DEFAULT 5 for the §10N operating point (5-bit bit-plane codes). Override e.g. IVF_QUANT_BITS=8 for int8.
-# Default 4: the shipping config is 4-bit Block-Sphere codes (§12), 512 B/doc. 5-bit uses the bit-plane
-# layout, which has no SIMD path (planeDot is a bit-scan), so it is slow and not the operating point.
-IVF_QUANT_BITS = os.environ.get("IVF_QUANT_BITS", "4")
+# IVF_QUANT_BITS: rerank code bit-depth. Write+read side. DEFAULT 8 (int8, one byte/dim): it measured
+# FASTER at BETTER recall than the 4-bit codebook (8.4x scan speedup), at ~2x the bytes/doc. 4 => 4-bit
+# codes (512 B/doc at dim=1024) but 4-bit cannot clear 0.95 recall; 5 => 5-bit bit-plane codes, which have
+# no SIMD path (planeDot is a bit-scan) and are slow.
+# NOTE: this only takes effect when IVF_QUANTIZER is the coordinate-wise 'osq' layout (now the codec
+# default). Under -Divf.quantizer=blocksphere4 the codebook layout wins and quantBits is IGNORED.
+IVF_QUANT_BITS = os.environ.get("IVF_QUANT_BITS", "8")
 # IVF_BEAM_SPILL=1 => -Divf.beamSpill=true: ADAPTIVE HNSW-beam spilling (§11). When ivfSpillBits>0 the
 # writer routes each doc through the centroid HNSW beam for its 1+spillBits nearest cells, then keeps only
 # the leading cells within IVF_SPILL_MARGIN× the nearest cell's distance — boundary docs spill, interior
@@ -332,6 +334,8 @@ def advise_will_need(file_name, offset_bytes=0, length_bytes=0):
 # KNN_JFR=1 enables it without editing this file (useful for one-off profiling runs, e.g. attributing
 # >RAM latency between CPU and I/O wait).
 DO_PROFILING = os.environ.get("KNN_JFR") == "1"
+# Monotonic counter so each profiled JVM invocation gets its own .jfr (see jfr_output).
+_JFR_SEQ = [0]
 DO_PS = True
 # vmstat is Linux-only; disable when the executable is unavailable (e.g. macOS)
 DO_VMSTAT = benchUtil.VMSTAT_PATH is not None
@@ -470,9 +474,23 @@ NOISY = True
 #  - can we expose greediness (global vs local queue exploration in KNN search) here?
 
 # test parameters. This script will run KnnGraphTester on every combination of these parameters
+
+def _env_tuple(name, default, cast=int):
+  """Comma-separated env override for a PARAMS sweep axis; unset => the literal default.
+
+  Added so HNSW-vs-lloydivf comparisons can be scripted. Without this, maxConn/fanout/indexType were
+  reachable only by editing PARAMS by hand, so a shell script that "swept" them silently ran the defaults
+  N times -- the same class of vacuous A/B that benchmarks.md 13 documents for the uring flags.
+  """
+  v = os.environ.get(name)
+  if not v:
+    return default
+  return tuple(cast(x.strip()) for x in v.split(",") if x.strip())
+
+
 PARAMS = {
   "ndoc": (1_000_000,),
-  "indexType": ("lloyd_ivf",),
+  "indexType": _env_tuple("KNN_INDEX_TYPE", ("lloyd_ivf",), str),
   # IVF params (ignored for hnsw runs)
   # Target ~50 docs/Voronoi cell: nlist = ndoc / 50 = 1_000_000 / 50 = 20_000.
   # nlist sweep: smaller cells (higher nlist) should reach recall=0.95 while visiting FEWER total docs
@@ -607,9 +625,11 @@ PARAMS = {
   "gcutBalancePenalty": (4.0,),
   "gcutAxes": (1,2,),
   # HNSW params (ignored for ivf runs); defaults maxConn=16, beamWidth=100 for good recall.
-  "maxConn": (16,),
-  "beamWidthIndex": (100,),
-  "fanout": (100,),
+  "maxConn": _env_tuple("KNN_MAXCONN", (16,)),
+  "beamWidthIndex": _env_tuple("KNN_BEAM_WIDTH", (100,)),
+  # fanout is SEARCH-time (efSearch = topK + fanout), so sweeping it reuses ONE graph -- the cheap recall
+  # lever benchmarks.md 7 flagged as "not run".
+  "fanout": _env_tuple("KNN_FANOUT", (100,)),
   "numSearchThread": (1,),
   "encoding": ("float32",),
   "metric": ("dot_product",),
@@ -2390,7 +2410,12 @@ def run_knn_benchmark(checkout, values, log_path):
   # query_vectors = f"/lucenedata/enwiki/{'cohere-wikipedia'}-queries-{dim}d.vec"
   # parentJoin_meta_file = f"{constants.BASE_DIR}/data/{'cohere-wikipedia'}-metadata.csv"
 
-  jfr_output = f"{constants.LOGS_DIR}/knn-perf-test.jfr"
+  # One .jfr PER INVOCATION. This function is called once per param combination (e.g. gcutAxes 1 then 2),
+  # and only the FIRST invocation reindexes -- later ones reuse the cached index and just search. With a
+  # single shared filename the last (search-only) JVM overwrote the recording that contained indexing and
+  # force-merge, so an indexing profile silently came back ~14 s of pure search.
+  jfr_output = f"{constants.LOGS_DIR}/knn-perf-test-{_JFR_SEQ[0]}.jfr"
+  _JFR_SEQ[0] += 1
 
   cp = benchUtil.classPathToString(benchUtil.getClassPath(checkout) + (f"{constants.BENCH_BASE_DIR}/build",))
   cmd = constants.JAVA_EXE.split(" ") + [
@@ -2445,6 +2470,23 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f"-Dlloyd.beamFactor={LLOYD_BEAM_FACTOR}"]
   if LLOYD_SCORE_IN_PLACE:
     cmd += ["-Dlloyd.scoreInPlace=true"]
+  # LLOYD_SHORTLIST_DEDUP=1 => -Dlloyd.shortlistDedup=true: move the spill dedup off the per-slot scan
+  # (JFR: FixedBitSet.getAndSet = 18.8% of warm CPU, ~250k random writes into a 4.75 MB bitset per query,
+  # plus a fresh maxDoc bitset allocated per query) and onto the BRUTE_N shortlist instead. Reader-side,
+  # no reindex; asserted bit-identical by TestUringRerankGather's shortlist-dedup cases.
+  if os.environ.get("LLOYD_SHORTLIST_DEDUP") == "1":
+    cmd += ["-Dlloyd.shortlistDedup=true"]
+  # LLOYD_CO_RESIDENT_CODES=1 => -Dlloyd.coResidentCodes=true: Stage G. Read each probed cell's CODE run
+  # contiguously alongside its sketch run, so the shortlist's int8 records are already in RAM and Stage D's
+  # ~2000 scattered reads are skipped. Reads ~8.2x more coarse bytes (only ~1% get reranked) in exchange
+  # for zero random reads -- wins where I/O time is hidden (CPU-bound) or storage is fast.
+  if os.environ.get("LLOYD_CO_RESIDENT_CODES") == "1":
+    cmd += ["-Dlloyd.coResidentCodes=true"]
+  # LLOYD_SCALAR_POPCOUNT=1 => -Dlloyd.scalarPopcount=true: CONTROL arm that restores the old
+  # single-accumulator Hamming loop. The default (unset) uses four independent accumulators so the
+  # XOR+CNT work pipelines and C2 auto-vectorizes -- xorBitCountInt was 26.5% of warm CPU, the top term.
+  if os.environ.get("LLOYD_SCALAR_POPCOUNT") == "1":
+    cmd += ["-Dlloyd.scalarPopcount=true"]
   if LLOYD_PREFETCH_CELLS:
     cmd += ["-Dlloyd.prefetchCells=true"]
   if os.environ.get("LLOYD_URING_SKETCH_SCAN") == "1":
@@ -2457,6 +2499,14 @@ def run_knn_benchmark(checkout, values, log_path):
   # overlap the Hamming scan instead of running as a separate blocking phase.
   if os.environ.get("LLOYD_URING_PIPELINE") == "1":
     cmd += ["-Dlloyd.uringPipeline=true"]
+  # Stage F: STREAMING rerank -- submit the coalesced code-record ranges and score each candidate as its
+  # bytes land, so the int8 rerank overlaps the cold reads instead of blocking for the whole gather first.
+  if os.environ.get("LLOYD_URING_RERANK_PIPELINE") == "1":
+    cmd += ["-Dlloyd.uringRerankPipeline=true"]
+  # O_DIRECT: open the reader's data file cache-bypassing, forcing the >RAM regime for the ring alone.
+  # A/B arm only -- measures the pure-device ceiling; not the realistic partial-cache number.
+  if os.environ.get("LLOYD_URING_DIRECT") == "1":
+    cmd += ["-Dlloyd.uringDirect=true"]
   if os.environ.get("LLOYD_PIPELINE_DEPTH") is not None:
     cmd += [f"-Dlloyd.pipelineDepth={os.environ['LLOYD_PIPELINE_DEPTH']}"]
   if os.environ.get("LLOYD_RERANK_AUDIT") == "1":
@@ -2483,6 +2533,16 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f"-Divf.centroidHnswBeamWidth={IVF_CENTROID_HNSW_BEAM_WIDTH}"]
   if IVF_SPILL_EF_SEARCH is not None:
     cmd += [f"-Divf.spillEfSearch={IVF_SPILL_EF_SEARCH}"]
+  # IVF_REUSE_GRAPH_TOPOLOGY=0 => -Divf.reuseGraphTopology=false, restoring a full HNSW build at every
+  # merge routing stage instead of refreshing the donor graph's int8 codes over the moved centroids. The
+  # codec DEFAULTS this on, so 0 is the control arm for pricing the indexing win.
+  #
+  # WRITE-TIME and NOT in the index key: it changes the persisted clustering (a reused topology routes docs
+  # slightly differently than a freshly built one), so the two arms MUST NOT share a cached index. Run the
+  # control with KNN_CLEAR_CACHE=1 -- otherwise the "off" arm silently reuses the "on" arm's index and
+  # measures nothing. Same class of trap as blockP below.
+  if os.environ.get("IVF_REUSE_GRAPH_TOPOLOGY") == "0":
+    cmd += ["-Divf.reuseGraphTopology=false"]
   if os.environ.get("IVF_QUANTIZER"):
     cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
   # Block size p for -Divf.quantizer=blocksphere. Write-time (it sets the on-disk bytes/block), and the
@@ -3400,6 +3460,23 @@ def build_java_base_cmd(checkout):
     cmd += [f"-Dlloyd.beamFactor={LLOYD_BEAM_FACTOR}"]
   if LLOYD_SCORE_IN_PLACE:
     cmd += ["-Dlloyd.scoreInPlace=true"]
+  # LLOYD_SHORTLIST_DEDUP=1 => -Dlloyd.shortlistDedup=true: move the spill dedup off the per-slot scan
+  # (JFR: FixedBitSet.getAndSet = 18.8% of warm CPU, ~250k random writes into a 4.75 MB bitset per query,
+  # plus a fresh maxDoc bitset allocated per query) and onto the BRUTE_N shortlist instead. Reader-side,
+  # no reindex; asserted bit-identical by TestUringRerankGather's shortlist-dedup cases.
+  if os.environ.get("LLOYD_SHORTLIST_DEDUP") == "1":
+    cmd += ["-Dlloyd.shortlistDedup=true"]
+  # LLOYD_CO_RESIDENT_CODES=1 => -Dlloyd.coResidentCodes=true: Stage G. Read each probed cell's CODE run
+  # contiguously alongside its sketch run, so the shortlist's int8 records are already in RAM and Stage D's
+  # ~2000 scattered reads are skipped. Reads ~8.2x more coarse bytes (only ~1% get reranked) in exchange
+  # for zero random reads -- wins where I/O time is hidden (CPU-bound) or storage is fast.
+  if os.environ.get("LLOYD_CO_RESIDENT_CODES") == "1":
+    cmd += ["-Dlloyd.coResidentCodes=true"]
+  # LLOYD_SCALAR_POPCOUNT=1 => -Dlloyd.scalarPopcount=true: CONTROL arm that restores the old
+  # single-accumulator Hamming loop. The default (unset) uses four independent accumulators so the
+  # XOR+CNT work pipelines and C2 auto-vectorizes -- xorBitCountInt was 26.5% of warm CPU, the top term.
+  if os.environ.get("LLOYD_SCALAR_POPCOUNT") == "1":
+    cmd += ["-Dlloyd.scalarPopcount=true"]
   if LLOYD_PREFETCH_CELLS:
     cmd += ["-Dlloyd.prefetchCells=true"]
   if os.environ.get("LLOYD_URING_SKETCH_SCAN") == "1":
@@ -3412,6 +3489,14 @@ def build_java_base_cmd(checkout):
   # overlap the Hamming scan instead of running as a separate blocking phase.
   if os.environ.get("LLOYD_URING_PIPELINE") == "1":
     cmd += ["-Dlloyd.uringPipeline=true"]
+  # Stage F: STREAMING rerank -- submit the coalesced code-record ranges and score each candidate as its
+  # bytes land, so the int8 rerank overlaps the cold reads instead of blocking for the whole gather first.
+  if os.environ.get("LLOYD_URING_RERANK_PIPELINE") == "1":
+    cmd += ["-Dlloyd.uringRerankPipeline=true"]
+  # O_DIRECT: open the reader's data file cache-bypassing, forcing the >RAM regime for the ring alone.
+  # A/B arm only -- measures the pure-device ceiling; not the realistic partial-cache number.
+  if os.environ.get("LLOYD_URING_DIRECT") == "1":
+    cmd += ["-Dlloyd.uringDirect=true"]
   if os.environ.get("LLOYD_PIPELINE_DEPTH") is not None:
     cmd += [f"-Dlloyd.pipelineDepth={os.environ['LLOYD_PIPELINE_DEPTH']}"]
   if os.environ.get("LLOYD_RERANK_AUDIT") == "1":
@@ -3438,6 +3523,16 @@ def build_java_base_cmd(checkout):
     cmd += [f"-Divf.centroidHnswBeamWidth={IVF_CENTROID_HNSW_BEAM_WIDTH}"]
   if IVF_SPILL_EF_SEARCH is not None:
     cmd += [f"-Divf.spillEfSearch={IVF_SPILL_EF_SEARCH}"]
+  # IVF_REUSE_GRAPH_TOPOLOGY=0 => -Divf.reuseGraphTopology=false, restoring a full HNSW build at every
+  # merge routing stage instead of refreshing the donor graph's int8 codes over the moved centroids. The
+  # codec DEFAULTS this on, so 0 is the control arm for pricing the indexing win.
+  #
+  # WRITE-TIME and NOT in the index key: it changes the persisted clustering (a reused topology routes docs
+  # slightly differently than a freshly built one), so the two arms MUST NOT share a cached index. Run the
+  # control with KNN_CLEAR_CACHE=1 -- otherwise the "off" arm silently reuses the "on" arm's index and
+  # measures nothing. Same class of trap as blockP below.
+  if os.environ.get("IVF_REUSE_GRAPH_TOPOLOGY") == "0":
+    cmd += ["-Divf.reuseGraphTopology=false"]
   if os.environ.get("IVF_QUANTIZER"):
     cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
   # Block size p for -Divf.quantizer=blocksphere. Write-time (it sets the on-disk bytes/block), and the

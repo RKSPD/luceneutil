@@ -39,15 +39,29 @@ PHASE="${PHASE:-both}"
 # Whole corpus: the .vec file holds EXACTLY 39,767,748 vectors (162,888,695,808 B / 4096 B), so this is
 # every doc, not a 40M prefix. Queries come from a separate file, so there is no train/test overlap.
 export KNN_NDOC=39767748
-# ~400 docs/cell at 40M. The 1M runs used nlist=2000 (~500/cell); nlist is capped at KMeans
-# MAX_NUM_CENTROIDS = 1<<20, so 100k is well inside it.
-export KNN_NLIST=100000
-# The ask: spillBits=10. NOTE this is a CAP, not the fan-out -- with beamSpill the writer keeps only the
-# leading cells within ivf.spillMargin x the nearest cell's distance (marginKeep), so interior docs stay
-# single-cell and only boundary docs approach 11 copies. spillMargin is left at the CODEC DEFAULT (1.10).
-export KNN_SPILL_BITS=10
+# nlist = 40,000 => ~994 docs/cell at 40M. Between the two configs measured so far.
+#
+# WHY NOT sqrt(N)=6306 (the classic FAISS heuristic): MEASURED AND REJECTED 2026-08-04. Warm at nlist=6306
+# (~6306 docs/cell), recall/latency was 0.717@10.8ms, 0.855@20.6ms, 0.931@56.2ms -- i.e. recall 0.931 cost
+# ~56 ms where nlist=100k does similar recall at ~13.5 ms (§15). Recall also degraded too STEEPLY with
+# nprobe to buy the docs/cell cost back by probing less (the §11a spill-frontier win did not transfer at
+# margin=1.15). Root cause: sqrt(N) balances a LINEAR coarse-scan against the fine scan, but this codec
+# routes through an HNSW centroid graph -- selection is O(log nlist), so the term sqrt(N) exists to balance
+# nearly vanishes and the optimum moves to MANY SMALLER cells. §6 measured the same gradient at 1M
+# (20k->65k nlist cut docs-visited ~23% and latency ~17% at fixed recall).
+# nlist is capped at KMeans MAX_NUM_CENTROIDS = 1<<20, so 40k is well inside it.
+export KNN_NLIST=40000
+# spillBits=5: a CAP, not the fan-out -- with beamSpill the writer keeps only the leading cells within
+# ivf.spillMargin x the nearest cell's distance (marginKeep), so interior docs stay single-cell and only
+# boundary docs approach 6 copies. spillMargin set explicitly to 1.15 below.
+export KNN_SPILL_BITS=5
+export IVF_SPILL_MARGIN=1.15
 # nprobe sweep: search-time => one index serves all five points.
-export KNN_NPROBE="${KNN_NPROBE:-40,55,70,90,120}"
+# Grid sized for ~994 docs/cell. Matching the DOCS-SCANNED volume of the nlist=6306 run's recall points
+# (0.717/0.855/0.931) needs nprobe ~32/76/254 here -- and recall should land BETTER than those, because
+# smaller cells drag in fewer irrelevant neighbours per probe (the §6 effect: 20k->65k cut docs-visited
+# 23% at FIXED recall). So this spans the predicted 0.93-0.95+ region with a low anchor for the curve.
+export KNN_NPROBE="${KNN_NPROBE:-20,40,80,150,250}"
 
 # p=2 Block-Sphere: -Divf.quantizer=blocksphere selects the p-dim-block layout, ivf.blockP=2 sets p.
 # (The codec now DEFAULTS to blocksphere4, i.e. p=4, so this MUST be set explicitly to get p=2.)
@@ -55,7 +69,9 @@ export KNN_NPROBE="${KNN_NPROBE:-40,55,70,90,120}"
 # a p=4 index. blockP is NOT in the key -- see the guard below.
 export IVF_QUANTIZER=blocksphere
 export IVF_BLOCK_P=2
-export IVF_QUANT_BITS=4
+# 8-bit quantization (was 4-bit). quantBits IS in the index key (qb8 vs qb4), so this builds a fresh index
+# rather than silently reusing the 4-bit one.
+export IVF_QUANT_BITS=8
 
 # Adaptive beam spill (the mechanism that makes spillBits a cap rather than a multiplier).
 export IVF_BEAM_SPILL=1
@@ -116,8 +132,8 @@ cd "$LUCENEUTIL_DIR"
 {
   echo "############################################################"
   echo "# 40M docs (39,767,748 = whole corpus), nlist=$KNN_NLIST"
-  echo "# BlockSphere p=2 (qzblocksphere, blockP=2), quantBits=4"
-  echo "# spillBits=$KNN_SPILL_BITS (CAP; adaptive beam spill, spillMargin=codec default 1.10)"
+  echo "# BlockSphere p=2 (qzblocksphere, blockP=2), quantBits=$IVF_QUANT_BITS"
+  echo "# spillBits=$KNN_SPILL_BITS (CAP; adaptive beam spill, spillMargin=$IVF_SPILL_MARGIN)"
   echo "# nprobe sweep: $KNN_NPROBE  (search-time -> ONE index serves all)"
   echo "# phase=$PHASE  started $(date)"
   echo "############################################################"
@@ -159,9 +175,17 @@ if [ "$PHASE" = "both" ] || [ "$PHASE" = "build" ]; then
   # Release on any exit so a killed build cannot leave 130 GiB pinned for the next run.
   trap './ram_balloon.sh --release >/dev/null 2>&1' EXIT INT TERM
   grep -E "^(MemFree|MemAvailable|Cached):" /proc/meminfo | tee -a "$RESULTS"
-  # Build only: one nprobe value, few queries. nprobe is search-time and out of the index key, so the
-  # index this produces serves every nprobe in phase 2.
-  KNN_NPROBE=40 KNN_NQUERY=100 \
+  # Build only: one nprobe value. nprobe is search-time and out of the index key, so the index this
+  # produces serves every nprobe in phase 2.
+  #
+  # NQUERY MUST MATCH THE SEARCH PHASE (1000, not 100): the exact-NN ground truth is cached under a key
+  # that INCLUDES nquery (knn-reuse/exact-nn/...-<nquery>-...-knn-100.bin). If the build computes only the
+  # 100-query GT, the search phase recomputes the 1000-query GT fresh -- and it does so AFTER inflating the
+  # tight ~10 GiB search balloon, so the numpy GT pass (1 GiB doc block + ~1 GiB BLAS score scratch +
+  # copies) OOMs. That is exactly how the 2026-08-03 23:41 run died at 95.6% of the GT pass (exit 137, no
+  # matching oom-kill line because it was the tight-envelope death, not the balloon-vs-JVM one). Computing
+  # the 1000-query GT HERE, under the roomy build balloon (~120 GiB free), caches it for phase 2 to reuse.
+  KNN_NPROBE=40 KNN_NQUERY="${KNN_NQUERY:-1000}" \
     ./run_knn_bench.sh 1 2>&1 | tee -a "$RESULTS"
   BUILD_RC=${PIPESTATUS[0]}
   echo "$IVF_BLOCK_P" > "$STAMP"
@@ -197,12 +221,17 @@ if [ "$PHASE" = "both" ] || [ "$PHASE" = "search" ]; then
   # Target cache = ~1/4 of the index, so the working set genuinely exceeds RAM but a realistic partial
   # cache remains. Floor of 8 GiB so the JVM + kernel are not starved into thrashing.
   #
-  # WARNING: sizing off the ON-DISK total OVERSHOOTS badly at quantBits=4. Only the code+sketch tables
-  # are ever touched by a query -- the harness reports that as vec_RAM, measured 39,442 MB (~38.5 GiB)
-  # for this index -- while the 150 GiB on disk is mostly spillBits=10 record DUPLICATION that no query
-  # reads. So INDEX_GIB/4 = 37 GiB is ~= the entire touched set: the balloon leaves room for all of it,
-  # the pass re-warms itself, and the "cold" row is a WARM number (the §13/§15 trap in yet another
-  # costume). Size against vec_RAM, not du. TARGET_CACHE_GIB overrides for that.
+  # WARNING: sizing off the ON-DISK total OVERSHOOTS badly -- much of the index is spill record
+  # DUPLICATION that no single query reads, so INDEX_GIB/4 can leave the whole touched set cached, the
+  # pass re-warms itself, and the "cold" row is a WARM number (the §13/§15 trap in yet another costume).
+  #
+  # CORRECTION (2026-08-04): an earlier version of this comment said to "size against vec_RAM, measured
+  # 39,442 MB". That was WRONG -- vec_RAM is not a measurement. KnnGraphTester.java:1301 computes it as
+  # totalVectorCount * (realEncodingByteSize * dim + overhead), i.e. from doc count / dim / encoding ONLY.
+  # It is blind to nlist, spill duplication and the sketch table, and prints the SAME value for configs
+  # with 2x different touched sets (verified identical for nlist=100k/sp10/qb4 vs nlist=6306/sp5/qb8).
+  # Do not use it as a touched-set proxy. Prefer an explicit small TARGET_CACHE_GIB, and VERIFY coldness
+  # from the result rows' avgCpuCount (~1.0 => warm/CPU-bound => invalid as a cold number).
   TARGET_CACHE="${TARGET_CACHE_GIB:-$(( INDEX_GIB / 4 ))}"
   [ "$TARGET_CACHE" -lt 8 ] && TARGET_CACHE=8
   # Search heap is small on purpose: the code/sketch tables are read through mmap (§12.6, the reader no
