@@ -1458,9 +1458,11 @@ public class KnnGraphTester implements FormatterLogger {
       if (fi != 5) {
         suffix.add("fi" + fi);
       }
-      // The codec now DEFAULTS to blocksphere, so record whatever is in effect (an absent marker used to
-      // mean "coordinate-wise", which silently let a blocksphere index be reused as an osq one).
-      suffix.add("qz" + System.getProperty("ivf.quantizer", "blocksphere").toLowerCase(Locale.ROOT));
+      // Record whatever quantizer is in effect (an absent marker used to mean "coordinate-wise", which
+      // silently let a blocksphere index be reused as an osq one). This default MUST track the codec's own
+      // (BlockSphereVectorQuantizer.QUANTIZER, now "osq"): if they disagree, an index BUILT as one encoding
+      // is KEYED as the other, and a later run silently reuses it across a quantizer change.
+      suffix.add("qz" + System.getProperty("ivf.quantizer", "osq").toLowerCase(Locale.ROOT));
       // Streaming-merge centroid training is WRITE-time (it determines the persisted centroids), so both
       // knobs belong in the key — otherwise a sweep silently reuses an index trained differently.
       int refine = Integer.getInteger("ivf.streamRefineIters", 1);
