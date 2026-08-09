@@ -70,5 +70,15 @@ echo "=== ivfaster INDEX JFR (fresh 1M build) $(date) ===" | tee "$LOG"
 echo "  nlist=$KNN_NLIST spill=$KNN_SPILL_BITS iters=$IVFASTER_LLOYD_ITERS fine=$IVFASTER_FINE_TIER" | tee -a "$LOG"
 ./run_knn_bench.sh 1 >> "$LOG" 2>&1
 echo "    exit=$?" | tee -a "$LOG"
+
+# PRESERVE THE INDEX RECORDING. Every profiled JVM writes logs/knn-perf-test-<seq>.jfr, and the sequence
+# RESTARTS per JVM -- so the search JVM overwrites the index JVM's file with the same name. That is how the
+# first ivfaster index profile was lost: only the 30-row summaries embedded in this log survived, and a
+# per-stage breakdown could not be re-derived from them.
+for f in "$OUT"/logs/knn-perf-test-*.jfr; do
+  [ -e "$f" ] || continue
+  cp -p "$f" "$OUT/logs/ivfaster-index-${STAMP}-$(basename "$f")"
+done
+echo "  preserved: $OUT/logs/ivfaster-index-${STAMP}-*.jfr" | tee -a "$LOG"
 grep -E "reindex takes|will now reindex|indexing took|force merge|simdEngaged|scalar" "$LOG" 2>/dev/null | head -20
 echo "=== done $(date). log: $LOG ; jfr in $OUT/logs/ ==="
