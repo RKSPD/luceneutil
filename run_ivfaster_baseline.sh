@@ -25,6 +25,21 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# A LIVE RUN AND A REBUILD CANNOT COEXIST. The JVM memory-maps the Lucene jars and resolves classes
+# LAZILY, so rebuilding them mid-run replaces files it is still holding: the next class it had not yet
+# touched fails with NoClassDefFoundError. That happened here as
+# "NoClassDefFoundError: org/apache/lucene/index/ReaderUtil" at the recall step -- a Lucene core class
+# that was present in the jar the whole time, and loadable on the same classpath afterwards.
+#
+# The misleading part is that it looks catastrophic and codec-shaped when it is neither: search had
+# already finished. But the numbers were void regardless, because the codec binary changed three times
+# mid-flight.
+if pgrep -f 'KnnGraphTester' > /dev/null; then
+  echo "ERROR: a KnnGraphTester run is already in flight." >&2
+  echo "  Rebuilding jars under a live JVM corrupts it -- wait for it, or kill it first." >&2
+  exit 1
+fi
+
 export LUCENE_DIR=${LUCENE_DIR:-/local/home/rikhil/vectordb/lucene}
 
 # Golden config: 1M Cohere-v3 wikipedia-en, 1024-d, DOT_PRODUCT, topK=100, one search thread,
