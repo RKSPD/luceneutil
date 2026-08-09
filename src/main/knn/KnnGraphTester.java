@@ -3194,31 +3194,31 @@ public class KnnGraphTester implements FormatterLogger {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
+                  case LLOYD_IVF, IVFASTER, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 2 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
+                  case LLOYD_IVF, IVFASTER, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 4 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
+                  case LLOYD_IVF, IVFASTER, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 7 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT, maxConn, beamWidth, numMergeWorker, exec);
-                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
+                  case LLOYD_IVF, IVFASTER, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               case 8 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE, maxConn, beamWidth, numMergeWorker, exec);
-                  case LLOYD_IVF, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
+                  case LLOYD_IVF, IVFASTER, FAISS -> throw new AssertionError("IVF/LSH/FAISS handled above");
               };
               default -> throw new IllegalArgumentException("Unsupported quantizeBits: " + quantizeBits);
           };
