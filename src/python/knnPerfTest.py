@@ -2672,12 +2672,21 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f'-Divfaster.lloydIters={os.environ["IVFASTER_LLOYD_ITERS"]}']
   # Coarse shortlist handed to the fine tier. SEARCH-TIME, so it sweeps against one cached index and is
   # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
+  # IVFASTER_NPROBE_MARGIN prunes selected cells on QUALITY: keep only cells within d1*margin of the
+  # nearest. SEARCH-TIME, so it sweeps against one cached index. 1.0 = off. Smaller keeps MORE cells.
+  if os.environ.get("IVFASTER_NPROBE_MARGIN"):
+    cmd += [f'-Divfaster.nprobeMargin={os.environ["IVFASTER_NPROBE_MARGIN"]}']
+
   if os.environ.get("IVFASTER_BRUTE_N"):
     cmd += [f'-Divfaster.bruteN={os.environ["IVFASTER_BRUTE_N"]}']
   # Diagnostic: exact centroid scan instead of the graph descent. This is the reference the graph's
   # recall is validated against, not a tuning knob.
   if os.environ.get("IVFASTER_FLAT_SELECT") == "1":
     cmd += ["-Divfaster.flatSelect=true"]
+  # Prints docs-scanned/query and which cell-select path ran. Diagnostic only; the counters are what
+  # make a per-doc cost comparison against another codec meaningful rather than inferred from nlist.
+  if os.environ.get("IVFASTER_REPORT") == "1":
+    cmd += ["-Divfaster.reportEngagement=true"]
   # Rotation-SimHash rounds R = bits per dimension (R*dim/8 bytes/doc; R=8 == osq8's 1 B/dim). Write-time:
   # it sets the on-disk record length, so it is part of the index identity -- a change needs KNN_CLEAR_CACHE=1
   # or the run silently reuses an index encoded at a different R. (Replaces IVF_SIMHASH_BITS, which named the
@@ -3773,6 +3782,10 @@ def build_java_base_cmd(checkout):
   # recall is validated against, not a tuning knob.
   if os.environ.get("IVFASTER_FLAT_SELECT") == "1":
     cmd += ["-Divfaster.flatSelect=true"]
+  # Prints docs-scanned/query and which cell-select path ran. Diagnostic only; the counters are what
+  # make a per-doc cost comparison against another codec meaningful rather than inferred from nlist.
+  if os.environ.get("IVFASTER_REPORT") == "1":
+    cmd += ["-Divfaster.reportEngagement=true"]
   # Rotation-SimHash rounds R = bits per dimension (R*dim/8 bytes/doc; R=8 == osq8's 1 B/dim). Write-time:
   # it sets the on-disk record length, so it is part of the index identity -- a change needs KNN_CLEAR_CACHE=1
   # or the run silently reuses an index encoded at a different R. (Replaces IVF_SIMHASH_BITS, which named the
