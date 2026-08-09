@@ -1740,7 +1740,13 @@ public class KnnGraphTester implements FormatterLogger {
         if (vectorsReader instanceof Lucene99HnswVectorsReader hnswVectorsReader) {
           knnValues = hnswVectorsReader.getGraph(field);
         } else {
-          throw new IllegalStateException("unsupported vectors reader: " + vectorsReader.getClass().getName());
+          // These are HNSW graph diagnostics (fanout, connectedness), so they simply do not apply to an
+          // IVF codec. Throwing aborted the run AFTER the first result was printed, which silently
+          // truncated a swept PARAMS product to its first point -- the sweep looked like it had produced
+          // one operating point rather than failed.
+          log("skipping fanout histogram: %s is not an HNSW reader\n",
+              vectorsReader.getClass().getSimpleName());
+          return;
         }
 
         log("Leaf %d has %d layers\n", context.ord, knnValues.numLevels());
