@@ -57,6 +57,7 @@ import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader;
 import org.apache.lucene.sandbox.codecs.faiss.FaissKnnVectorsFormat;
+import org.apache.lucene.sandbox.codecs.ivfaster.IVFasterVectorsFormat;
 import org.apache.lucene.sandbox.codecs.lloydivf.LloydIVFVectorsFormat;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CodecReader;
@@ -149,6 +150,7 @@ public class KnnGraphTester implements FormatterLogger {
     HNSW,
     FLAT,
     LLOYD_IVF,
+    IVFASTER,
     FAISS
   }
 
@@ -224,6 +226,8 @@ public class KnnGraphTester implements FormatterLogger {
   private IndexType indexType;
   // IVF (org.apache.lucene.sandbox.codecs.ivf.IVFVectorsFormat) parameters
   private int ivfNlist;
+  /** -ivfCoarseClip: coarse grid half-width; 0 means keep the codec default for the chosen variant. */
+  private float ivfCoarseClip;
   private int ivfNprobe;
   // Hier IVF two-level knobs: subNlist sub-centroids per coarse cell (write-time), subNprobe sub-cells
   // scanned per probed coarse cell (search-time). Only used when indexType == HIER_IVF.
@@ -462,12 +466,107 @@ public class KnnGraphTester implements FormatterLogger {
             case "lloydivf":
               indexType = IndexType.LLOYD_IVF;
               break;
+            case "ivfaster":
+              indexType = IndexType.IVFASTER;
+              break;
             case "faiss":
               indexType = IndexType.FAISS;
               break;
             default:
               throw new IllegalArgumentException(
-                  "-indexType can be 'hnsw', 'flat', 'lloyd_ivf' or 'faiss' only");
+                  "-indexType can be 'hnsw', 'flat', 'lloyd_ivf', 'ivfaster' or 'faiss' only");
+          }
+          break;
+        case "-ivfQuantizer":
+          // The FINE (rerank) tier encoding. Sets the system property the codec reads, so the value reaches
+          // BlockSphereVectorQuantizer through the same path as before -- but because it arrives as a swept
+          // ARG it also lands in the index key below, which an env var never did.
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfQuantizer requires a following string");
+          }
+          System.setProperty("ivf.quantizer", args[++iarg]);
+          break;
+        case "-ivfExcelsixorBits":
+          // Doc planes b for excelsixor4 (bits/dim). Write-time: it sets the record length.
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfExcelsixorBits requires a following int");
+          }
+          System.setProperty("ivf.excelsixorBits", args[++iarg]);
+          break;
+        case "-ivfFineClip":
+          // FINE-tier grid half-width. Distinct from -ivfCoarseClip: different tier, different distribution,
+          // independent optimum. 0 leaves the codec's per-depth default.
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfFineClip requires a following float");
+          }
+          float fineClip = Float.parseFloat(args[++iarg]);
+          if (fineClip > 0) {
+            System.setProperty("lloyd.exorb4Clip", Float.toString(fineClip));
+          }
+          break;
+        case "-ivfCoarseClip":
+          // Coarse grid half-width. 0 (the default) means "leave the codec's own default", so the two variants
+          // keep their distinct swept optima (1.5 asymmetric / 1.0 symmetric) without this arg having to know
+          // which one is active. Must be parsed BEFORE -ivfCoarse sets the variant, so order-independence is
+          // handled by stashing it and applying it in -ivfCoarse below.
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfCoarseClip requires a following float");
+          }
+          ivfCoarseClip = Float.parseFloat(args[++iarg]);
+          break;
+        case "-ivfCoarse":
+          // The COARSE sketch-plane encoding: "sign" (1-bit) or "xortex2" (2-bit level code).
+          //
+          // xortex2 REQUIRES BOTH SKETCH PLANES. -Dlloyd.xortex2Coarse only decides what the LOW plane
+          // CONTAINS; -Dlloyd.sketchLoBits is what makes that plane EXIST. Setting the former without the
+          // latter yields a 1-bit sign sketch and silently discards the whole 2-bit tier -- a run voided
+          // exactly that way, and it is defect #6 in benchmarks.md 18.24 recurring. Coupling both to one
+          // value here makes the pair impossible to get wrong.
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-ivfCoarse requires a following string");
+          }
+          String coarse = args[++iarg];
+          switch (coarse) {
+            case "sign":
+              // BARE 1-bit sign sketch. This is the OLD coarse tier and it is NOT the golden config: it
+              // measured 0.879 e2e here versus the golden 0.95. Kept only as an explicit control.
+              break;
+            case "rot":
+              // THE SHIPPED GOLDEN COARSE TIER (benchmarks.md: -Dlloyd.sketchRotPlane, +0.013..+0.035 recall
+              // at identical 256 B/doc, 8.9% faster at equal recall). Plane 2 becomes the sign plane of a
+              // second seeded rotation instead of the Gray low bit, so it needs BOTH planes to exist.
+              System.setProperty("lloyd.sketchLoBits", "true");
+              System.setProperty("lloyd.sketchRotPlane", "true");
+              break;
+            case "xortex2":
+              if (ivfCoarseClip > 0) {
+                System.setProperty("lloyd.xortex2Clip", Float.toString(ivfCoarseClip));
+              }
+              // ASYMMETRIC: the 2-bit uniform level code scored as an EXACT quantized dot. Higher survival
+              // offline (+0.071 @250) but 10.4 vs 5.5 ns/doc.
+              //
+              // CAVEAT, measured: the reader calls XortexCoarseKernel.scoreBulkNegated with docLevelSum=null
+              // because the 256 B sketch carries no per-doc level sum, and that kernel's javadoc records the
+              // omission as biasing survival@250 from 0.9863 to 0.4300. Measured e2e here at 0.603 (bruteN
+              // 2000) and 0.165 (bruteN 400) -- so this variant is NOT usable until the level sums are
+              // persisted. Prefer "xortex2sym".
+              System.setProperty("lloyd.sketchLoBits", "true");
+              System.setProperty("lloyd.xortex2Coarse", "true");
+              break;
+            case "xortex2sym":
+              if (ivfCoarseClip > 0) {
+                System.setProperty("lloyd.xortex2SymClip", Float.toString(ivfCoarseClip));
+              }
+              // SYMMETRIC: a 3-level THERMOMETER code scored by the SHIPPED fused Hamming kernel. For a
+              // thermometer, popcount(q^hi) + popcount(qLo^lo) IS the summed per-dim level distance
+              // |L_q - L_d|, so it needs NO new kernel, NO per-doc scalar, and therefore has none of the
+              // asymmetric path's omitted-affine-term bias. 32 ops/doc, ~5.5 ns -- the incumbent's cost.
+              System.setProperty("lloyd.sketchLoBits", "true");
+              System.setProperty("lloyd.xortex2Sym", "true");
+              break;
+            default:
+              throw new IllegalArgumentException(
+                  "-ivfCoarse must be 'sign', 'rot', 'xortex2' or 'xortex2sym', got: " + coarse);
           }
           break;
         case "-ivfNlist":
@@ -1001,6 +1100,12 @@ public class KnnGraphTester implements FormatterLogger {
     // Per-segment LSH search parallelism (search-time; does NOT affect the index, hence not in the index
     // key). Set BEFORE any index is opened below, because LSHVectorsReader.SEARCH_THREADS is initialized
     // from this property when that class is first loaded (which happens on the first index open).
+    if (indexType == IndexType.IVFASTER) {
+      // ivfaster's reader honors -Divfaster.nprobe as a search-time scan budget, so nprobe stays out
+      // of its index key and one cached index serves an entire sweep. Setting it here, from the same
+      // ivfNprobe the other IVF arms use, keeps the arms driven by one grid.
+      System.setProperty("ivfaster.nprobe", Integer.toString(ivfNprobe));
+    }
     if (indexType == IndexType.LLOYD_IVF) {
       // The Lloyd IVF codec reader honors -Dlloyd.nprobe as a search-time scan
       // budget, so one cached index serves any swept nprobe and nprobe stays out of its index key.
@@ -1428,6 +1533,19 @@ public class KnnGraphTester implements FormatterLogger {
       String params = faissIndexParams.replace("{nlist}", Integer.toString(ivfNlist))
                                       .replace("{nprobe}", Integer.toString(ivfNprobe));
       suffix.add((desc + "_" + params).replaceAll("[^A-Za-z0-9]", ""));
+    } else if (indexType == IndexType.IVFASTER) {
+      // Write-time parameters only. nprobe and bruteN are read per query from system properties, so
+      // one cached index serves an entire sweep over them -- which is what makes a latency-at-recall
+      // curve cheap to produce.
+      suffix.add("ivfaster");
+      suffix.add("nl" + ivfNlist);
+      suffix.add("sp" + ivfSpillBits);
+      if (ivfSpillBits > 0 && ivfSoarLambda > 0) {
+        suffix.add("soar" + ivfSoarLambda);
+      }
+      suffix.add("it" + System.getProperty("ivfaster.lloydIters", "3"));
+      // The fine tier changes every code byte, so it belongs in the key.
+      suffix.add("fine" + System.getProperty("ivfaster.fineTier", "int8"));
     } else if (indexType == IndexType.LLOYD_IVF) {
       // Minimal Lloyd IVF. nlist/spillBits/soar/kmeans are baked into the on-disk index. nprobe is a
       // pure search-time scan budget: the reader honors a -Dlloyd.nprobe override (set above from
@@ -1463,6 +1581,29 @@ public class KnnGraphTester implements FormatterLogger {
       // (BlockSphereVectorQuantizer.QUANTIZER, now "osq"): if they disagree, an index BUILT as one encoding
       // is KEYED as the other, and a later run silently reuses it across a quantizer change.
       suffix.add("qz" + System.getProperty("ivf.quantizer", "osq").toLowerCase(Locale.ROOT));
+      // Fine-tier DEPTH is write-time (it sets the record length), so an index built at b=8 must not be
+      // reused for b=4. Only emitted for excelsixor4, which is the only encoding that reads it, so existing
+      // osq index keys are unchanged.
+      String qz = System.getProperty("ivf.quantizer", "osq");
+      if ("xortex8".equalsIgnoreCase(qz) || "excelsixor4".equalsIgnoreCase(qz)) {
+        suffix.add("xb" + Integer.getInteger("ivf.excelsixorBits", 4));
+        // Fine clip is write-time; only emitted when explicitly set, so existing keys stay valid.
+        String fc = System.getProperty("lloyd.exorb4Clip");
+        if (fc != null) {
+          suffix.add("fc" + fc);
+        }
+      }
+      // COARSE encoding is write-time too (it sets what the persisted sketch planes contain). Absent marker
+      // == the 1-bit sign sketch, so pre-existing keys stay valid.
+      if (Boolean.getBoolean("lloyd.xortex2Coarse")) {
+        // Clip is WRITE-time (it sets the grid the doc planes are packed on) and was NOT in the key, so a clip
+        // sweep silently reused an index built at a different clip. Both variants' clips are keyed now.
+        suffix.add("cx2c" + System.getProperty("lloyd.xortex2Clip", "1.5"));
+      } else if (Boolean.getBoolean("lloyd.xortex2Sym")) {
+        suffix.add("cx2symc" + System.getProperty("lloyd.xortex2SymClip", "1.0"));
+      } else if (Boolean.getBoolean("lloyd.sketchRotPlane")) {
+        suffix.add("crot");
+      }
       // Streaming-merge centroid training is WRITE-time (it determines the persisted centroids), so both
       // knobs belong in the key — otherwise a sweep silently reuses an index trained differently.
       int refine = Integer.getInteger("ivf.streamRefineIters", 1);
@@ -3000,6 +3141,27 @@ public class KnnGraphTester implements FormatterLogger {
               @Override
               public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
                   return faissFormat;
+              }
+          };
+      }
+      if (indexType == IndexType.IVFASTER) {
+          // ivfaster: brute-scan 2/8 routing, the Reaper, a cache-aligned centroid graph. Reuses the
+          // shared ivf* nlist/nprobe/spillBits/soarLambda knobs so it is driven by the same grid as
+          // the other IVF arms and the comparison is like-for-like.
+          //
+          // nprobe and bruteN are SEARCH-time (system properties the reader reads per query), so they
+          // are omitted from the index key and one cached index serves a whole sweep. Everything that
+          // changes the bytes on disk -- nlist, spillBits, soarLambda, lloydIters, the fine tier -- is
+          // in the key. Five voided runs in this project came from a write-time knob that was not.
+          final int ivfasterIters =
+              Integer.parseInt(System.getProperty("ivfaster.lloydIters", "3"));
+          final KnnVectorsFormat ivfasterFormat =
+              new IVFasterVectorsFormat(
+                  ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfasterIters);
+          return new Lucene104Codec() {
+              @Override
+              public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+                  return ivfasterFormat;
               }
           };
       }

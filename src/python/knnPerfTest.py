@@ -232,6 +232,76 @@ IVF_BEAM_SPILL = os.environ.get("IVF_BEAM_SPILL") == "1"
 IVF_SPILL_MARGIN = os.environ.get("IVF_SPILL_MARGIN")
 # LLOYD_RERANK_BITS: simulate B-bit rerank in sketch-scan (§10M gate). Default 8 (real int8). 4 => 4-bit.
 LLOYD_RERANK_BITS = os.environ.get("LLOYD_RERANK_BITS")
+# LLOYD_SKETCH_LO_BITS=1 => -Dlloyd.sketchLoBits=true: persist the Gray-coded LOW sketch plane alongside the
+# sign plane, making the coarse tier a full 2-bit code. WRITE-TIME (a second persisted column) -> reindex per
+# value. REQUIRED by IVF_QUANTIZER=residual4, whose 4-bit record stores only the residual and reconstructs
+# its 2-bit bucket from these two planes -- without it the index cannot be built or read.
+LLOYD_SKETCH_LO_BITS = os.environ.get("LLOYD_SKETCH_LO_BITS") == "1"
+
+# LLOYD_SKETCH_ROT_PLANE=1 => -Dlloyd.sketchRotPlane=true: make the SECOND sketch plane the sign plane of a
+# seeded ROTATION instead of the Gray code's per-dim magnitude bit. Same bytes, same two-plane layout, same
+# symmetric XOR+popcount scan -- only plane 2's CONTENT changes. Measured byte-matched at 256 B/doc, shortlist
+# recall of the exact top-100: 0.9291 vs 0.8886 at N=250, 0.9870 vs 0.9696 at N=500 -- i.e. the incumbent's
+# N=500 quality at roughly N=250, and rerank cost is linear in N.
+# WRITE-TIME (it sets what is in the persisted plane) and NOT part of the index cache key, so sweeping it
+# REQUIRES KNN_CLEAR_CACHE=1 or the second arm silently reuses the first arm's index and measures nothing.
+# Requires LLOYD_SKETCH_LO_BITS=1 (it replaces that plane's content, it does not add a plane).
+# INCOMPATIBLE with IVF_QUANTIZER=residual4, which decodes bucket midpoints from the sign+lo pair; the codec
+# throws rather than silently mis-decoding.
+LLOYD_SKETCH_ROT_PLANE = os.environ.get("LLOYD_SKETCH_ROT_PLANE") == "1"
+# LLOYD_NO_DEDUP_IN_SELECT=1 => -Dlloyd.noDedupInSelect=true: restore the OLD select-then-dedup coarse
+# shortlist (select BRUTE_N posting SLOTS, dedup spill copies afterwards). Default OFF, i.e. dedup-in-select
+# is ON: the shortlist is widened by the spill cap and deduped DURING selection so it holds BRUTE_N distinct
+# DOCS. SEARCH-time only, so one cached index A/Bs both arms.
+LLOYD_NO_DEDUP_IN_SELECT = os.environ.get("LLOYD_NO_DEDUP_IN_SELECT") == "1"
+# LLOYD_COARSE_BUCKET_DOT=1 => -Dlloyd.coarseBucketDot=true: rank the coarse shortlist by the ASYMMETRIC
+# bucket-dot Sum(exact_query[d] * 2bit_bucket_d) instead of symmetric 2-bit Gray Hamming. Reads the SAME two
+# planes (no extra bytes) but keeps the query exact, so it carries strictly more information. SEARCH-time, so
+# one cached index A/Bs it against Hamming.
+LLOYD_COARSE_BUCKET_DOT = os.environ.get("LLOYD_COARSE_BUCKET_DOT") == "1"
+# LLOYD_NO_CARRY_BUCKET_DOT=1 => -Dlloyd.noCarryBucketDot=true: DISABLE the plane carry. Default OFF, i.e.
+# the carry is ON whenever the bucket-dot ranker is active: the coarse select already computes Sum(q*bucket)
+# per candidate, so rerank takes it from there and reads ONLY the 520 B nibble record instead of also
+# re-reading the two 128 B planes (776 B/doc) to recompute the same term. Pure bandwidth win on the
+# DRAM-bound rerank pole. SEARCH-time, so one cached index A/Bs carry on vs off. Only meaningful with
+# LLOYD_COARSE_BUCKET_DOT=1 (the Hamming select has no Sum(q*bucket) to carry).
+LLOYD_NO_CARRY_BUCKET_DOT = os.environ.get("LLOYD_NO_CARRY_BUCKET_DOT") == "1"
+# LLOYD_RERANK_BUCKET_ONLY=1 => -Dlloyd.rerankBucketOnly=true: DIAGNOSTIC. Rerank scores with the 2-bit
+# bucket term ALONE (drops the 4-bit nibble), to measure how much recall the fine tier buys. Search-time.
+LLOYD_RERANK_BUCKET_ONLY = os.environ.get("LLOYD_RERANK_BUCKET_ONLY") == "1"
+# LLOYD_INT8_QUERY=1 => -Dlloyd.int8Query=true: score residual4 rerank with an int8-quantized query (integer
+# short-lane MAC, no float convert) instead of the exact float. Search-time A/B; recall ~identical (query
+# int8 error only), latency win is compute-only so expected small on the DRAM-bound rerank.
+LLOYD_INT8_QUERY = os.environ.get("LLOYD_INT8_QUERY") == "1"
+# IVF_R4_DECOUPLED=1 => -Divf.residual4Decoupled=true: DECOUPLED residual4. Coarse lo plane freed from the
+# fine tier -> equal-mass 2.0-bit coarse (quartile threshold, sharper spill); fine tier = sign+nibble 5-bit
+# signed magnitude (no lo read). WRITE-time -> reindex (KNN_CLEAR_CACHE=1).
+IVF_R4_DECOUPLED = os.environ.get("IVF_R4_DECOUPLED") == "1"
+# IVF_R4_FINE_CLIP=x => -Divf.residual4FineClip=x: decoupled fine-tier magnitude clamp (units of std), the
+# range [0,x*std] the 16 |v| levels span. Independent of the coarse clip. WRITE-time -> reindex.
+IVF_R4_FINE_CLIP = os.environ.get("IVF_R4_FINE_CLIP")
+# LLOYD_COARSE_SIGN_ONLY=1 => -Dlloyd.coarseSignOnly=true: rank with the SIGN plane only (1-bit), leaving the
+# residual4 rerank intact. Isolates how much the lo plane contributes to RANKING.
+LLOYD_COARSE_SIGN_ONLY = os.environ.get("LLOYD_COARSE_SIGN_ONLY") == "1"
+# LLOYD_SKETCH_LO_CLIP=x => -Dlloyd.sketchLoClip=x: half-width of the 2-bit bucket range, in units of an
+# ASSUMED per-dim std of 1/sqrt(dim). WRITE-TIME: it defines the bucket boundaries that BOTH sketch planes and
+# the residual4 nibble encode against, so it must match between writer and reader and a change reindexes.
+# NOTE it is NOT in the index cache key, so sweep it with KNN_CLEAR_CACHE=1.
+# Measured on rotated cohere-v3-1024d: true per-dim std is 0.0274, i.e. 0.875x the assumed 1/sqrt(dim)
+# =0.03125 -- so the default 3.5 places boundaries ~14% wider than the data, crowding mass into the middle
+# buckets. 3.06 reproduces the intended boundaries in TRUE std units.
+LLOYD_SKETCH_LO_CLIP = os.environ.get("LLOYD_SKETCH_LO_CLIP")
+# IVF_R4_DENSITY_LEVELS=1 => -Divf.residual4DensityLevels=true: place the 4-bit residual's 16 levels by
+# DENSITY (a degree-5 polynomial fit of the Lloyd-Max points, so no lookup table) instead of uniformly.
+# Pairs with the equal-mass 2-bit buckets: uniform levels must span the unbounded outer bucket with the same
+# 16 steps the inner bucket uses, which is 5.1x coarser over half the mass. WRITE-TIME -> reindex.
+# LLOYD_R4_TILE=N => -Dlloyd.r4Tile=N: candidates per residual4 tiled-rerank kernel call (1 = no tiling).
+# SEARCH-time, so one cached index sweeps it.
+LLOYD_R4_TILE = os.environ.get("LLOYD_R4_TILE")
+# LLOYD_COARSE_SIGN_W=k => -Dlloyd.coarseSignW=k: weight on the SIGN plane in the 2-bit coarse Hamming
+# distance (dist = k*popcount(sign) + popcount(lo)). 1 (default) is plain Hamming, which weights both planes
+# equally -- but a sign flip moves the Gray bucket index by 2-3 while a lo flip moves it by 1, so equal
+# weighting is miscalibrated. k=2 matches the bucket geometry at the cost of one shift-add. SEARCH-time.
 # IVF_ENABLE_COPY_MERGE: the codec default is now the warm-start re-cluster merge path (seed centroids
 # from the largest donor segment + GRAPH_ROUTE_ITERS graph-routed Lloyd passes over ALL merged docs +
 # requantize) — centroids adapt to the merged distribution, best recall. Set True => -Divf.enableCopyMerge
@@ -277,7 +347,7 @@ IVF_DROP_RAW_VECTORS = False
 # Number of concurrent indexing threads passed to KnnGraphTester (-numIndexThreads). Affects build
 # wall-clock only; with -forceMerge the final single-segment index is concurrency-independent. This box
 # has 12 cores. Used at both the search-and-stats and the search-only command builders below.
-NUM_INDEX_THREADS = 8
+NUM_INDEX_THREADS = int(os.environ.get("KNN_INDEX_THREADS", "8"))
 # IO_METHOD = "mmap"
 
 
@@ -488,6 +558,14 @@ def _env_tuple(name, default, cast=int):
   return tuple(cast(x.strip()) for x in v.split(",") if x.strip())
 
 
+def _env_int_tuple_or(name, default):
+  """Int tuple from a comma-separated env var, falling back to `default` when unset."""
+  raw = os.environ.get(name)
+  if not raw:
+    return default
+  return tuple(int(x) for x in raw.replace(" ", "").split(",") if x)
+
+
 PARAMS = {
   "ndoc": (1_000_000,),
   "indexType": _env_tuple("KNN_INDEX_TYPE", ("lloyd_ivf",), str),
@@ -554,6 +632,39 @@ PARAMS = {
   "ivfCentroidRefineFactor": (1,),
   "ivfPqSubspaces": (0,),
   "ivfBlockSize": (0,),
+  # QUANTIZER TIERS AS SWEPT PARAMS, not env vars. Both are WRITE-TIME (they set what is in the record and
+  # in the sketch planes), so they belong in the index key -- which is exactly why they are here and not in
+  # the env-var block below.
+  #
+  # WHY THIS EXISTS. These were env-only (IVF_QUANTIZER / IVF_EXCELSIXOR_BITS / LLOYD_XORTEX2_COARSE), and
+  # env vars are invisible to the PARAMS product, so a multi-arm sweep could not vary them per arm: every
+  # arm in one process shared whatever the environment happened to hold. Two runs were silently voided that
+  # way -- three arms that all reused a single `qzosq` index while claiming to test excelsixor4. As a swept
+  # param the value reaches -ivfQuantizer / -ivfExcelsixorBits / -ivfCoarse per RUN and lands in the index
+  # key, so a wrong reuse is impossible rather than merely unlikely.
+  #
+  # ivfQuantizer: the FINE (rerank) tier record encoding -- "osq" (int8) or "xortex8" (the uniform-level
+  # bit-sliced code; "excelsixor4" is its legacy alias, whose trailing 4 was a VARIANT number, never
+  # bits/dim). ivfExcelsixorBits: doc planes b for xortex8, i.e. bits/dim (8 -> 1024 B/doc); ignored by osq.
+  # ivfCoarse: the COARSE sketch-plane encoding -- "sign" (1-bit sign sketch) or "xortex2" (the 2-bit level
+  # code, the b=2 member of the same family, which needs BOTH sketch planes and so implies sketchLoBits).
+  "ivfQuantizer": _env_tuple("KNN_QUANTIZER", ("osq",), str),
+  "ivfExcelsixorBits": _env_int_tuple_or("KNN_EXCELSIXOR_BITS", (8,)),
+  "ivfCoarse": _env_tuple("KNN_COARSE", ("sign",), str),
+  # Coarse-grid CLIP half-width, in units of the rotated per-dim std. WRITE-TIME (it sets the grid the doc
+  # planes are packed on) and it was NOT in the index cache key, so a clip sweep silently reused an index built
+  # at a different clip -- scoring docs under one grid with a query quantized on another. Now keyed
+  # (cx2c<clip> / cx2symc<clip>). Swept optima: 1.5 asymmetric, 1.0 symmetric. Ignored by sign/rot.
+  "ivfCoarseClip": _env_tuple("KNN_COARSE_CLIP", (0.0,), float),
+  # FINE-tier grid clip (-Dlloyd.exorb4Clip), a SEPARATE knob from ivfCoarseClip -- the two tiers quantize
+  # different things (the fine tier codes v-mu at b bits/dim; the coarse tier codes a 2-bit sketch), so one value
+  # cannot serve both and there is no reason their optima should coincide.
+  #
+  # THIS HAD NO PASSTHROUGH AT ALL until now: `lloyd.exorb4Clip` was unreachable from the harness, so every run
+  # this session silently used defaultClipForBits() (2.0/2.5/3.0/3.5 for b=4/5/6/8). WRITE-TIME (it sets the grid
+  # the doc planes are packed on) and now IN THE INDEX KEY as fc<clip>, so a sweep cannot reuse an index built at
+  # another clip. 0 == keep the codec default for the active depth.
+  "ivfFineClip": _env_tuple("KNN_FINE_CLIP", (0.0,), float),
   # LSH params (ignored unless indexType="lsh"). hashBits => up to 2^hashBits buckets;
   # nprobe buckets probed per query; rerankFactor>1 enables exact full-precision rerank.
   # bucketPoolFactor: multi-probe over-fetches bucketPoolFactor*nprobe buckets, re-ranks them by
@@ -632,7 +743,7 @@ PARAMS = {
   "fanout": _env_tuple("KNN_FANOUT", (100,)),
   "numSearchThread": (1,),
   "encoding": ("float32",),
-  "metric": ("dot_product",),
+  "metric": _env_tuple("KNN_METRIC", ("dot_product",), str),
   # 8-bit scalar-quantized HNSW, for a fair int8-vs-int8 comparison against the int8 lloyd_ivf codec.
   "quantizeBits": (8,),
   "topK": (100,),
@@ -660,6 +771,7 @@ for _env_name, _param in (
   ("KNN_SPILL_BITS", "ivfSpillBits"),
   ("KNN_NPROBE", "ivfNprobe"),
   ("KNN_NQUERY", "nquery"),
+  ("KNN_TOPK", "topK"),
   ("KNN_FLUSH_ITERS", "ivfFlushIters"),
 ):
   _vals = _env_int_tuple(_env_name)
@@ -2476,6 +2588,10 @@ def run_knn_benchmark(checkout, values, log_path):
   # no reindex; asserted bit-identical by TestUringRerankGather's shortlist-dedup cases.
   if os.environ.get("LLOYD_SHORTLIST_DEDUP") == "1":
     cmd += ["-Dlloyd.shortlistDedup=true"]
+  if os.environ.get("LLOYD_ROUTE_AUDIT") == "1":
+    cmd += ["-Dlloyd.routeAudit=true"]
+  if os.environ.get("LLOYD_NO_GRAPH") == "1":
+    cmd += ["-Dlloyd.noGraph=true"]
   # LLOYD_CO_RESIDENT_CODES=1 => -Dlloyd.coResidentCodes=true: Stage G. Read each probed cell's CODE run
   # contiguously alongside its sketch run, so the shortlist's int8 records are already in RAM and Stage D's
   # ~2000 scattered reads are skipped. Reads ~8.2x more coarse bytes (only ~1% get reranked) in exchange
@@ -2545,6 +2661,60 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += ["-Divf.reuseGraphTopology=false"]
   if os.environ.get("IVF_QUANTIZER"):
     cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
+  # ---- ivfaster ----
+  # IVFASTER_FINE_TIER selects the fine (rerank) quantizer: int8 | xortex8. WRITE-TIME -- it sets every
+  # code byte and the record length -- so it is in the index key on the Java side and a change needs
+  # KNN_CLEAR_CACHE=1, or the run silently scores an index encoded by the other tier.
+  if os.environ.get("IVFASTER_FINE_TIER"):
+    cmd += [f'-Divfaster.fineTier={os.environ["IVFASTER_FINE_TIER"]}']
+  # Lloyd iterations over the corpus. WRITE-TIME: it changes the centroids, hence every assignment.
+  if os.environ.get("IVFASTER_LLOYD_ITERS"):
+    cmd += [f'-Divfaster.lloydIters={os.environ["IVFASTER_LLOYD_ITERS"]}']
+  # Coarse shortlist handed to the fine tier. SEARCH-TIME, so it sweeps against one cached index and is
+  # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
+  if os.environ.get("IVFASTER_BRUTE_N"):
+    cmd += [f'-Divfaster.bruteN={os.environ["IVFASTER_BRUTE_N"]}']
+  # Diagnostic: exact centroid scan instead of the graph descent. This is the reference the graph's
+  # recall is validated against, not a tuning knob.
+  if os.environ.get("IVFASTER_FLAT_SELECT") == "1":
+    cmd += ["-Divfaster.flatSelect=true"]
+  # Rotation-SimHash rounds R = bits per dimension (R*dim/8 bytes/doc; R=8 == osq8's 1 B/dim). Write-time:
+  # it sets the on-disk record length, so it is part of the index identity -- a change needs KNN_CLEAR_CACHE=1
+  # or the run silently reuses an index encoded at a different R. (Replaces IVF_SIMHASH_BITS, which named the
+  # dead dense-anchor form; the property is now -Divf.simhashRounds.)
+  if os.environ.get("IVF_SIMHASH_ROUNDS"):
+    cmd += [f'-Divf.simhashRounds={os.environ["IVF_SIMHASH_ROUNDS"]}']
+  # EXCELSIXOR doc bits per dimension (levels = 2^(b-1) bit planes). WRITE-TIME: it sets the record length, so
+  # changing it REQUIRES KNN_CLEAR_CACHE=1 or the run silently reuses an index encoded at a different b.
+  if os.environ.get("IVF_EXCELSIXOR_BITS"):
+    cmd += [f'-Divf.excelsixorBits={os.environ["IVF_EXCELSIXOR_BITS"]}']
+  # LLOYD_XORTEX2_COARSE=1 => -Dlloyd.xortex2Coarse=true: score the two-plane 256 B sketch as an EXACT 2-bit
+  # quantized dot instead of a Hamming distance over two sign planes. WRITE-time (it changes what the planes
+  # MEAN), so a change requires KNN_CLEAR_CACHE=1 -- a stale index would be read with the wrong plane semantics.
+  if os.environ.get("LLOYD_XORTEX2_COARSE") == "1":
+    cmd += ["-Dlloyd.xortex2Coarse=true"]
+  # LLOYD_XORTEX2_SYM=1 => symmetric thermometer coarse code, scored by the SHIPPED fused Hamming kernel (no new
+  # kernel, no reader branch). WRITE-time: changes what the planes mean, so KNN_CLEAR_CACHE=1 is required.
+  if os.environ.get("LLOYD_XORTEX2_SYM") == "1":
+    cmd += ["-Dlloyd.xortex2Sym=true"]
+  # LLOYD_EXORB4_QBITS: query magnitude planes for the excelsixor4 rerank. SEARCH-time only (zero doc bytes), so a
+  # sweep reuses one index. Had no passthrough until now, which means every excelsixor4 run so far used the default
+  # qb=6 -- and the estimator diagnostic points at QUERY quantization as the binding error term, so this is the
+  # knob that matters.
+  if os.environ.get("LLOYD_EXORB4_QBITS"):
+    cmd += [f'-Dlloyd.exorb4QBits={os.environ["LLOYD_EXORB4_QBITS"]}']
+  # LLOYD_NO_SIMD_BITSLICED=1 => -Dlloyd.noSimdBitSliced=true: forces the ARRAY path (loadPlanes + scalar/array
+  # kernel) instead of the segment-direct SIMD kernel. Both compute the same value, so this is a pure A/B on the
+  # KERNEL: if recall changes, the segment-direct path is misreading the record.
+  if os.environ.get("LLOYD_NO_SIMD_BITSLICED") == "1":
+    cmd += ["-Dlloyd.noSimdBitSliced=true"]
+  if os.environ.get("LLOYD_XORTEX2_SYM_CLIP"):
+    cmd += [f'-Dlloyd.xortex2SymClip={os.environ["LLOYD_XORTEX2_SYM_CLIP"]}']
+  if os.environ.get("LLOYD_XORTEX2_CLIP"):
+    cmd += [f'-Dlloyd.xortex2Clip={os.environ["LLOYD_XORTEX2_CLIP"]}']
+  # Query-side magnitude bit-planes for the EXCELSIXOR rerank (search-time only; measured to saturate at 4).
+  if os.environ.get("LLOYD_EXCELSIXOR_QBITS"):
+    cmd += [f'-Dlloyd.excelsixorQBits={os.environ["LLOYD_EXCELSIXOR_QBITS"]}']
   # Block size p for -Divf.quantizer=blocksphere. Write-time (it sets the on-disk bytes/block), and the
   # codec default is already 2, so an unset value happens to give p=2 today -- pass it explicitly anyway
   # so the run does not silently depend on that default. NOTE: blockP is NOT in the index key (only
@@ -2554,6 +2724,12 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f'-Divf.blockP={os.environ["IVF_BLOCK_P"]}']
   if IVF_STREAM_FLUSH_MIN_DOCS is not None:
     cmd += [f"-Divf.streamFlushMinDocs={IVF_STREAM_FLUSH_MIN_DOCS}"]
+  # IVF_STREAM_MERGE_MIN_DOCS: docs above which the MERGE uses the streamed (re-cluster) writer instead of
+  # the buffered one. Codec default is 2*trainSampleCap (400k), so any >=400k corpus takes the streamed
+  # merge path -- the path residual4's carry-the-sketch invariant is easiest to break in, and which small
+  # unit tests never exercise. Set very high to force the buffered path for an A/B. WRITE-TIME.
+  if os.environ.get("IVF_STREAM_MERGE_MIN_DOCS"):
+    cmd += [f'-Divf.streamMergeMinDocs={os.environ["IVF_STREAM_MERGE_MIN_DOCS"]}']
   if IVF_TRAIN_SAMPLE_CAP is not None:
     cmd += [f"-Divf.trainSampleCap={IVF_TRAIN_SAMPLE_CAP}"]
   if os.environ.get("LLOYD_PREFETCH_AUDIT") == "1":
@@ -2601,11 +2777,50 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += ["-Dlloyd.sketchScan=true"]
     if os.environ.get("LLOYD_BRUTE_N"):
       cmd += [f'-Dlloyd.bruteN={os.environ["LLOYD_BRUTE_N"]}']
+    # LLOYD_MARGIN: search-time adaptive-nprobe prune (-Dlloyd.margin). Probe UP TO nprobe cells but stop
+    # early, keeping cell j only while d_j <= d_0/M. Reader-only, so it sweeps on ONE cached index. This is
+    # the "fewer CANDIDATES" lever -- the only one left after prefix truncation (fewer BYTES) was rejected
+    # and every faster-kernel restructuring measured negative.
+    if os.environ.get("LLOYD_MARGIN"):
+      cmd += [f'-Dlloyd.margin={os.environ["LLOYD_MARGIN"]}']
+    # LLOYD_XORTEX8_DUMP / LLOYD_DUMP_QUERIES: true-path parity diagnostics. The first dumps (docId, dot)
+    # from the LIVE xortex8 scorer, the second the rotated queries it scored, so an offline encoder can be
+    # run on IDENTICAL inputs. Reproduction-vs-reproduction parity cannot find a defect in the reader.
+    if os.environ.get("LLOYD_XORTEX8_DUMP"):
+      cmd += [f'-Dlloyd.xortex8Dump={os.environ["LLOYD_XORTEX8_DUMP"]}']
+    if os.environ.get("LLOYD_DUMP_QUERIES"):
+      cmd += [f'-Dlloyd.dumpQueries={os.environ["LLOYD_DUMP_QUERIES"]}']
     _sd = os.environ.get("LLOYD_SKETCH_DIMS", "1024")
     cmd += [f"-Dlloyd.ceilBruteDims={_sd}"]
     cmd += [f"-Dlloyd.sketchDims={_sd}"]
     if LLOYD_RERANK_BITS:
       cmd += [f"-Dlloyd.rerankBits={LLOYD_RERANK_BITS}"]
+    if LLOYD_SKETCH_LO_BITS:
+      cmd += ["-Dlloyd.sketchLoBits=true"]
+    if LLOYD_SKETCH_ROT_PLANE:
+      cmd += ["-Dlloyd.sketchRotPlane=true"]
+    if LLOYD_NO_DEDUP_IN_SELECT:
+      cmd += ["-Dlloyd.noDedupInSelect=true"]
+    if LLOYD_COARSE_BUCKET_DOT:
+      cmd += ["-Dlloyd.coarseBucketDot=true"]
+    if LLOYD_NO_CARRY_BUCKET_DOT:
+      cmd += ["-Dlloyd.noCarryBucketDot=true"]
+    if LLOYD_RERANK_BUCKET_ONLY:
+      cmd += ["-Dlloyd.rerankBucketOnly=true"]
+    if LLOYD_INT8_QUERY:
+      cmd += ["-Dlloyd.int8Query=true"]
+    if IVF_R4_DECOUPLED:
+      cmd += ["-Divf.residual4Decoupled=true"]
+    if IVF_R4_FINE_CLIP:
+      cmd += [f"-Divf.residual4FineClip={IVF_R4_FINE_CLIP}"]
+    if LLOYD_COARSE_SIGN_ONLY:
+      cmd += ["-Dlloyd.coarseSignOnly=true"]
+    if LLOYD_SKETCH_LO_CLIP:
+      cmd += [f"-Dlloyd.sketchLoClip={LLOYD_SKETCH_LO_CLIP}"]
+    if LLOYD_R4_TILE:
+      cmd += [f"-Dlloyd.r4Tile={LLOYD_R4_TILE}"]
+    if os.environ.get("LLOYD_COARSE_SIGN_W"):
+      cmd += [f'-Dlloyd.coarseSignW={os.environ["LLOYD_COARSE_SIGN_W"]}']
   if IVF_RERANK_FACTOR is not None:
     cmd += [f"-Divf.rerankFactor={IVF_RERANK_FACTOR}"]
   if IVF_ENABLE_COPY_MERGE:
@@ -2661,7 +2876,9 @@ def run_knn_benchmark(checkout, values, log_path):
   else:
     print("check_vector_overlap: SKIPPED (CHECK_VECTOR_OVERLAP=False); not scanning for doc/query duplicates")
 
-  if CHECK_QUERY_DOC_MODEL_CONSISTENCY:
+  if CHECK_QUERY_DOC_MODEL_CONSISTENCY and os.environ.get("KNN_SKIP_MODEL_CHECK") != "1":
+    # KNN_SKIP_MODEL_CHECK=1 escapes the dual-encoder guard: the Cohere-v3 corpus has a KNOWN benign mean
+    # drift (~29% at 1M, below the 30% error threshold, but a SUBSET sample can exceed it and hard-error).
     metric_check = values.get("metric", ("dot_product",))[0]
     knnExactNN.check_query_doc_distribution_match(
       doc_vectors, 0, n_doc_check, query_vectors, query_start_check, n_query_check, dim, encoding_check, metric=metric_check, n_sample=QUERY_DOC_MODEL_CONSISTENCY_SAMPLE
@@ -3466,6 +3683,10 @@ def build_java_base_cmd(checkout):
   # no reindex; asserted bit-identical by TestUringRerankGather's shortlist-dedup cases.
   if os.environ.get("LLOYD_SHORTLIST_DEDUP") == "1":
     cmd += ["-Dlloyd.shortlistDedup=true"]
+  if os.environ.get("LLOYD_ROUTE_AUDIT") == "1":
+    cmd += ["-Dlloyd.routeAudit=true"]
+  if os.environ.get("LLOYD_NO_GRAPH") == "1":
+    cmd += ["-Dlloyd.noGraph=true"]
   # LLOYD_CO_RESIDENT_CODES=1 => -Dlloyd.coResidentCodes=true: Stage G. Read each probed cell's CODE run
   # contiguously alongside its sketch run, so the shortlist's int8 records are already in RAM and Stage D's
   # ~2000 scattered reads are skipped. Reads ~8.2x more coarse bytes (only ~1% get reranked) in exchange
@@ -3535,6 +3756,60 @@ def build_java_base_cmd(checkout):
     cmd += ["-Divf.reuseGraphTopology=false"]
   if os.environ.get("IVF_QUANTIZER"):
     cmd += [f'-Divf.quantizer={os.environ["IVF_QUANTIZER"]}']
+  # ---- ivfaster ----
+  # IVFASTER_FINE_TIER selects the fine (rerank) quantizer: int8 | xortex8. WRITE-TIME -- it sets every
+  # code byte and the record length -- so it is in the index key on the Java side and a change needs
+  # KNN_CLEAR_CACHE=1, or the run silently scores an index encoded by the other tier.
+  if os.environ.get("IVFASTER_FINE_TIER"):
+    cmd += [f'-Divfaster.fineTier={os.environ["IVFASTER_FINE_TIER"]}']
+  # Lloyd iterations over the corpus. WRITE-TIME: it changes the centroids, hence every assignment.
+  if os.environ.get("IVFASTER_LLOYD_ITERS"):
+    cmd += [f'-Divfaster.lloydIters={os.environ["IVFASTER_LLOYD_ITERS"]}']
+  # Coarse shortlist handed to the fine tier. SEARCH-TIME, so it sweeps against one cached index and is
+  # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
+  if os.environ.get("IVFASTER_BRUTE_N"):
+    cmd += [f'-Divfaster.bruteN={os.environ["IVFASTER_BRUTE_N"]}']
+  # Diagnostic: exact centroid scan instead of the graph descent. This is the reference the graph's
+  # recall is validated against, not a tuning knob.
+  if os.environ.get("IVFASTER_FLAT_SELECT") == "1":
+    cmd += ["-Divfaster.flatSelect=true"]
+  # Rotation-SimHash rounds R = bits per dimension (R*dim/8 bytes/doc; R=8 == osq8's 1 B/dim). Write-time:
+  # it sets the on-disk record length, so it is part of the index identity -- a change needs KNN_CLEAR_CACHE=1
+  # or the run silently reuses an index encoded at a different R. (Replaces IVF_SIMHASH_BITS, which named the
+  # dead dense-anchor form; the property is now -Divf.simhashRounds.)
+  if os.environ.get("IVF_SIMHASH_ROUNDS"):
+    cmd += [f'-Divf.simhashRounds={os.environ["IVF_SIMHASH_ROUNDS"]}']
+  # EXCELSIXOR doc bits per dimension (levels = 2^(b-1) bit planes). WRITE-TIME: it sets the record length, so
+  # changing it REQUIRES KNN_CLEAR_CACHE=1 or the run silently reuses an index encoded at a different b.
+  if os.environ.get("IVF_EXCELSIXOR_BITS"):
+    cmd += [f'-Divf.excelsixorBits={os.environ["IVF_EXCELSIXOR_BITS"]}']
+  # LLOYD_XORTEX2_COARSE=1 => -Dlloyd.xortex2Coarse=true: score the two-plane 256 B sketch as an EXACT 2-bit
+  # quantized dot instead of a Hamming distance over two sign planes. WRITE-time (it changes what the planes
+  # MEAN), so a change requires KNN_CLEAR_CACHE=1 -- a stale index would be read with the wrong plane semantics.
+  if os.environ.get("LLOYD_XORTEX2_COARSE") == "1":
+    cmd += ["-Dlloyd.xortex2Coarse=true"]
+  # LLOYD_XORTEX2_SYM=1 => symmetric thermometer coarse code, scored by the SHIPPED fused Hamming kernel (no new
+  # kernel, no reader branch). WRITE-time: changes what the planes mean, so KNN_CLEAR_CACHE=1 is required.
+  if os.environ.get("LLOYD_XORTEX2_SYM") == "1":
+    cmd += ["-Dlloyd.xortex2Sym=true"]
+  # LLOYD_EXORB4_QBITS: query magnitude planes for the excelsixor4 rerank. SEARCH-time only (zero doc bytes), so a
+  # sweep reuses one index. Had no passthrough until now, which means every excelsixor4 run so far used the default
+  # qb=6 -- and the estimator diagnostic points at QUERY quantization as the binding error term, so this is the
+  # knob that matters.
+  if os.environ.get("LLOYD_EXORB4_QBITS"):
+    cmd += [f'-Dlloyd.exorb4QBits={os.environ["LLOYD_EXORB4_QBITS"]}']
+  # LLOYD_NO_SIMD_BITSLICED=1 => -Dlloyd.noSimdBitSliced=true: forces the ARRAY path (loadPlanes + scalar/array
+  # kernel) instead of the segment-direct SIMD kernel. Both compute the same value, so this is a pure A/B on the
+  # KERNEL: if recall changes, the segment-direct path is misreading the record.
+  if os.environ.get("LLOYD_NO_SIMD_BITSLICED") == "1":
+    cmd += ["-Dlloyd.noSimdBitSliced=true"]
+  if os.environ.get("LLOYD_XORTEX2_SYM_CLIP"):
+    cmd += [f'-Dlloyd.xortex2SymClip={os.environ["LLOYD_XORTEX2_SYM_CLIP"]}']
+  if os.environ.get("LLOYD_XORTEX2_CLIP"):
+    cmd += [f'-Dlloyd.xortex2Clip={os.environ["LLOYD_XORTEX2_CLIP"]}']
+  # Query-side magnitude bit-planes for the EXCELSIXOR rerank (search-time only; measured to saturate at 4).
+  if os.environ.get("LLOYD_EXCELSIXOR_QBITS"):
+    cmd += [f'-Dlloyd.excelsixorQBits={os.environ["LLOYD_EXCELSIXOR_QBITS"]}']
   # Block size p for -Divf.quantizer=blocksphere. Write-time (it sets the on-disk bytes/block), and the
   # codec default is already 2, so an unset value happens to give p=2 today -- pass it explicitly anyway
   # so the run does not silently depend on that default. NOTE: blockP is NOT in the index key (only
@@ -3544,6 +3819,12 @@ def build_java_base_cmd(checkout):
     cmd += [f'-Divf.blockP={os.environ["IVF_BLOCK_P"]}']
   if IVF_STREAM_FLUSH_MIN_DOCS is not None:
     cmd += [f"-Divf.streamFlushMinDocs={IVF_STREAM_FLUSH_MIN_DOCS}"]
+  # IVF_STREAM_MERGE_MIN_DOCS: docs above which the MERGE uses the streamed (re-cluster) writer instead of
+  # the buffered one. Codec default is 2*trainSampleCap (400k), so any >=400k corpus takes the streamed
+  # merge path -- the path residual4's carry-the-sketch invariant is easiest to break in, and which small
+  # unit tests never exercise. Set very high to force the buffered path for an A/B. WRITE-TIME.
+  if os.environ.get("IVF_STREAM_MERGE_MIN_DOCS"):
+    cmd += [f'-Divf.streamMergeMinDocs={os.environ["IVF_STREAM_MERGE_MIN_DOCS"]}']
   if IVF_TRAIN_SAMPLE_CAP is not None:
     cmd += [f"-Divf.trainSampleCap={IVF_TRAIN_SAMPLE_CAP}"]
   if os.environ.get("LLOYD_PREFETCH_AUDIT") == "1":
@@ -3596,6 +3877,32 @@ def build_java_base_cmd(checkout):
     cmd += [f"-Dlloyd.sketchDims={_sd}"]
     if LLOYD_RERANK_BITS:
       cmd += [f"-Dlloyd.rerankBits={LLOYD_RERANK_BITS}"]
+    if LLOYD_SKETCH_LO_BITS:
+      cmd += ["-Dlloyd.sketchLoBits=true"]
+    if LLOYD_SKETCH_ROT_PLANE:
+      cmd += ["-Dlloyd.sketchRotPlane=true"]
+    if LLOYD_NO_DEDUP_IN_SELECT:
+      cmd += ["-Dlloyd.noDedupInSelect=true"]
+    if LLOYD_COARSE_BUCKET_DOT:
+      cmd += ["-Dlloyd.coarseBucketDot=true"]
+    if LLOYD_NO_CARRY_BUCKET_DOT:
+      cmd += ["-Dlloyd.noCarryBucketDot=true"]
+    if LLOYD_RERANK_BUCKET_ONLY:
+      cmd += ["-Dlloyd.rerankBucketOnly=true"]
+    if LLOYD_INT8_QUERY:
+      cmd += ["-Dlloyd.int8Query=true"]
+    if IVF_R4_DECOUPLED:
+      cmd += ["-Divf.residual4Decoupled=true"]
+    if IVF_R4_FINE_CLIP:
+      cmd += [f"-Divf.residual4FineClip={IVF_R4_FINE_CLIP}"]
+    if LLOYD_COARSE_SIGN_ONLY:
+      cmd += ["-Dlloyd.coarseSignOnly=true"]
+    if LLOYD_SKETCH_LO_CLIP:
+      cmd += [f"-Dlloyd.sketchLoClip={LLOYD_SKETCH_LO_CLIP}"]
+    if LLOYD_R4_TILE:
+      cmd += [f"-Dlloyd.r4Tile={LLOYD_R4_TILE}"]
+    if os.environ.get("LLOYD_COARSE_SIGN_W"):
+      cmd += [f'-Dlloyd.coarseSignW={os.environ["LLOYD_COARSE_SIGN_W"]}']
   if IVF_RERANK_FACTOR is not None:
     cmd += [f"-Divf.rerankFactor={IVF_RERANK_FACTOR}"]
   if IVF_ENABLE_COPY_MERGE:
