@@ -34,7 +34,10 @@ cd "$(dirname "$0")"
 # The misleading part is that it looks catastrophic and codec-shaped when it is neither: search had
 # already finished. But the numbers were void regardless, because the codec binary changed three times
 # mid-flight.
-if pgrep -f 'KnnGraphTester' > /dev/null; then
+# Matches only a JAVA process running the tester, not any shell command that happens to contain the
+# string. `pgrep -f KnnGraphTester` matched this script's own launcher and every diagnostic command
+# mentioning it, so the guard blocked legitimate runs and made absent runs look live.
+if ps -eo args 2>/dev/null | grep -qE '^[^ ]*java .*knn\.KnnGraphTester'; then
   echo "ERROR: a KnnGraphTester run is already in flight." >&2
   echo "  Rebuilding jars under a live JVM corrupts it -- wait for it, or kill it first." >&2
   exit 1
