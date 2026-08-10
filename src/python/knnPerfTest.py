@@ -2667,6 +2667,38 @@ def run_knn_benchmark(checkout, values, log_path):
   # KNN_CLEAR_CACHE=1, or the run silently scores an index encoded by the other tier.
   if os.environ.get("IVFASTER_FINE_TIER"):
     cmd += [f'-Divfaster.fineTier={os.environ["IVFASTER_FINE_TIER"]}']
+  # IVFASTER_COARSE_LEVELS: thermometer levels in the COARSE tier. 3 (default) = 2 bits/dim, 256 B at
+  # dim=1024; 2 = the 1-bit sign sketch at half the bytes. WRITE-TIME (it sets how many plane sections
+  # exist and the coarse code length) so it is in the index key -- the reader throws CorruptIndexException
+  # on a mismatch rather than misreading records.
+  # IVFASTER_SPILL_MARGIN: boundary width for SPILL selection. WRITE-TIME (it decides which docs get a
+  # spilled copy), so it is in the index key. Larger = more docs treated as boundary = more spill.
+  # Blocked stage-and-score with an early exit. SEARCH-time. A HEURISTIC (coarse order does not bound
+  # the fine score), so it always needs a recall number alongside the latency.
+  if os.environ.get("IVFASTER_EARLY_TERM") == "1":
+    cmd += ["-Divfaster.earlyTerm=true"]
+    if os.environ.get("IVFASTER_EARLY_TERM_BLOCK"):
+      cmd += [f'-Divfaster.earlyTermBlock={os.environ["IVFASTER_EARLY_TERM_BLOCK"]}']
+    # Absolute slack on the [0,1] similarity scale. NEGATIVE fires EARLIER (more aggressive).
+    if os.environ.get("IVFASTER_EARLY_TERM_SLACK"):
+      cmd += [f'-Divfaster.earlyTermSlack={os.environ["IVFASTER_EARLY_TERM_SLACK"]}']
+  if os.environ.get("IVFASTER_SPILL_MARGIN"):
+    cmd += [f'-Divfaster.spillMargin={os.environ["IVFASTER_SPILL_MARGIN"]}']
+  if os.environ.get("IVFASTER_COARSE_BITS"):
+    cmd += [f'-Divfaster.coarseBits={os.environ["IVFASTER_COARSE_BITS"]}']
+  # IVFASTER_INT8_CENTRE=1: centre the int8 fine codes on the persisted global mean. WRITE-TIME.
+  if os.environ.get("IVFASTER_INT8_CENTRE") == "1":
+    cmd += ["-Divfaster.int8Centre=true"]
+  # Core's NATIVE uint8 dot for the rerank (VectorUtil routes to it). Needs libdotProduct on the
+  # library path; the codec prefers it over its own Panama tile when present (3.2x at the rerank shape).
+  # The LOCAL batched UDOT library (kernels/native/build.sh writes /tmp/libivfasterudot.so). The int8
+  # tier prefers it over core's per-call path, which allocates a MemorySegment wrapper per candidate.
+  if os.environ.get("IVFASTER_UDOT_LIB"):
+    cmd += [f'-Divfaster.udotLib={os.environ["IVFASTER_UDOT_LIB"]}']
+  if os.environ.get("LUCENE_NATIVE_DOT") == "1":
+    cmd += ["-Dlucene.useNativeDotProduct=true", "--enable-native-access=ALL-UNNAMED"]
+    if os.environ.get("LUCENE_NATIVE_LIB_PATH"):
+      cmd += [f'-Djava.library.path={os.environ["LUCENE_NATIVE_LIB_PATH"]}']
   # Lloyd iterations over the corpus. WRITE-TIME: it changes the centroids, hence every assignment.
   if os.environ.get("IVFASTER_LLOYD_ITERS"):
     cmd += [f'-Divfaster.lloydIters={os.environ["IVFASTER_LLOYD_ITERS"]}']
@@ -2679,14 +2711,58 @@ def run_knn_benchmark(checkout, values, log_path):
 
   if os.environ.get("IVFASTER_BRUTE_N"):
     cmd += [f'-Divfaster.bruteN={os.environ["IVFASTER_BRUTE_N"]}']
+
+  # The vector admission filter (Hamming kernel filterAtMost) is ON by default -- it measured
+  # 0.889->0.860 ms at nprobe=30 / 1.070->1.017 at nprobe=40, recall bit-identical. IVFASTER_NO_SIMD_ADMIT=1
+  # => -Divfaster.noSimdAdmit=true restores the scalar min-of-four unroll: the CONTROL ARM. Top-k is
+  # unchanged either way (same tightening contract, final histogram cut re-derives the true threshold), so
+  # recall MUST match between arms -- if it moves, the two survivor sets disagree and that is a defect.
+  # IVFASTER_SIMD_ADMIT_BLOCK sets the sub-block size the threshold snapshot governs (default 256).
+  if os.environ.get("IVFASTER_NO_SIMD_ADMIT") == "1":
+    cmd += ["-Divfaster.noSimdAdmit=true"]
+  if os.environ.get("IVFASTER_SIMD_ADMIT_BLOCK"):
+    cmd += [f'-Divfaster.simdAdmitBlock={os.environ["IVFASTER_SIMD_ADMIT_BLOCK"]}']
+
+  # IVFASTER_COARSE_MF=1 => -Divfaster.coarseMf=true: score the coarse scan with the NitroxMF matched
+  # filter instead of sign-Hamming. SEARCH-TIME (reader-only), but REQUIRES a 1-plane index
+  # (IVFASTER_COARSE_BITS=1) since the MF doc side IS that sign plane; on a 2-bit index it is ignored.
+  # A matched filter weights each hyperplane by the query's projection magnitude, so it ranks the SAME
+  # 128 B/doc sign code more sharply than a flat popcount -- half nitrox2's coarse bytes. Recall must be
+  # compared, not assumed equal: it is a different (better-ranked) coarse score, not a faster identical one.
+  # IVFASTER_MF_QUERY_BITS sets the query weight-plane depth (default 2 = eight popcounts, matched to nitrox2).
+  if os.environ.get("IVFASTER_COARSE_MF") == "1":
+    cmd += ["-Divfaster.coarseMf=true"]
+    if os.environ.get("IVFASTER_MF_QUERY_BITS"):
+      cmd += [f'-Divfaster.mfQueryBits={os.environ["IVFASTER_MF_QUERY_BITS"]}']
+
+  # IVFASTER_NO_UDOT=1 => -Divfaster.noUdot=true: force the JAVA int8 rerank even when the native UDOT
+  # library is present. This is the CONTROL ARM -- the native kernel is loaded opportunistically, so
+  # without a way to switch it off there is no way to attribute a latency change to it rather than to
+  # the run. Both arms read the same index and score identically (integer dot is exact), so recall must
+  # come out the same; if it moves, the two paths disagree and that is a defect, not a speedup.
+  if os.environ.get("IVFASTER_NO_UDOT") == "1":
+    cmd += ['-Divfaster.noUdot=true']
+
+  # IVFASTER_UDOT_LIB points at the native kernel when it is not in /tmp.
+  if os.environ.get("IVFASTER_UDOT_LIB"):
+    cmd += [f'-Divfaster.udotLib={os.environ["IVFASTER_UDOT_LIB"]}']
   # Diagnostic: exact centroid scan instead of the graph descent. This is the reference the graph's
   # recall is validated against, not a tuning knob.
   if os.environ.get("IVFASTER_FLAT_SELECT") == "1":
     cmd += ["-Divfaster.flatSelect=true"]
   # Prints docs-scanned/query and which cell-select path ran. Diagnostic only; the counters are what
   # make a per-doc cost comparison against another codec meaningful rather than inferred from nlist.
+  # Caps how many VISITED centroids the fine tier verifies, as a multiple of nprobe. 0 = verify all
+  # (the reference). The descent visits several times ef, so the uncapped verify is ~489 centroids at
+  # nlist=2000/np40 -- a quarter of the index -- to pick ~22 cells.
+  if os.environ.get("IVFASTER_VERIFY_MULT"):
+    cmd += [f'-Divfaster.verifyMultiplier={os.environ["IVFASTER_VERIFY_MULT"]}']
   if os.environ.get("IVFASTER_REPORT") == "1":
     cmd += ["-Divfaster.reportEngagement=true"]
+  # Counts DISTINCT documents among the scanned slots, to measure spill amplification directly rather
+  # than inferring it from spillBits. Adds a full extra pass over every scanned slot -- DIAGNOSTIC ONLY.
+  if os.environ.get("IVFASTER_MEASURE_SPILL") == "1":
+    cmd += ["-Divfaster.measureSpill=true", "-Divfaster.reportEngagement=true"]
   # Rotation-SimHash rounds R = bits per dimension (R*dim/8 bytes/doc; R=8 == osq8's 1 B/dim). Write-time:
   # it sets the on-disk record length, so it is part of the index identity -- a change needs KNN_CLEAR_CACHE=1
   # or the run silently reuses an index encoded at a different R. (Replaces IVF_SIMHASH_BITS, which named the
@@ -3771,6 +3847,38 @@ def build_java_base_cmd(checkout):
   # KNN_CLEAR_CACHE=1, or the run silently scores an index encoded by the other tier.
   if os.environ.get("IVFASTER_FINE_TIER"):
     cmd += [f'-Divfaster.fineTier={os.environ["IVFASTER_FINE_TIER"]}']
+  # IVFASTER_COARSE_LEVELS: thermometer levels in the COARSE tier. 3 (default) = 2 bits/dim, 256 B at
+  # dim=1024; 2 = the 1-bit sign sketch at half the bytes. WRITE-TIME (it sets how many plane sections
+  # exist and the coarse code length) so it is in the index key -- the reader throws CorruptIndexException
+  # on a mismatch rather than misreading records.
+  # IVFASTER_SPILL_MARGIN: boundary width for SPILL selection. WRITE-TIME (it decides which docs get a
+  # spilled copy), so it is in the index key. Larger = more docs treated as boundary = more spill.
+  # Blocked stage-and-score with an early exit. SEARCH-time. A HEURISTIC (coarse order does not bound
+  # the fine score), so it always needs a recall number alongside the latency.
+  if os.environ.get("IVFASTER_EARLY_TERM") == "1":
+    cmd += ["-Divfaster.earlyTerm=true"]
+    if os.environ.get("IVFASTER_EARLY_TERM_BLOCK"):
+      cmd += [f'-Divfaster.earlyTermBlock={os.environ["IVFASTER_EARLY_TERM_BLOCK"]}']
+    # Absolute slack on the [0,1] similarity scale. NEGATIVE fires EARLIER (more aggressive).
+    if os.environ.get("IVFASTER_EARLY_TERM_SLACK"):
+      cmd += [f'-Divfaster.earlyTermSlack={os.environ["IVFASTER_EARLY_TERM_SLACK"]}']
+  if os.environ.get("IVFASTER_SPILL_MARGIN"):
+    cmd += [f'-Divfaster.spillMargin={os.environ["IVFASTER_SPILL_MARGIN"]}']
+  if os.environ.get("IVFASTER_COARSE_BITS"):
+    cmd += [f'-Divfaster.coarseBits={os.environ["IVFASTER_COARSE_BITS"]}']
+  # IVFASTER_INT8_CENTRE=1: centre the int8 fine codes on the persisted global mean. WRITE-TIME.
+  if os.environ.get("IVFASTER_INT8_CENTRE") == "1":
+    cmd += ["-Divfaster.int8Centre=true"]
+  # Core's NATIVE uint8 dot for the rerank (VectorUtil routes to it). Needs libdotProduct on the
+  # library path; the codec prefers it over its own Panama tile when present (3.2x at the rerank shape).
+  # The LOCAL batched UDOT library (kernels/native/build.sh writes /tmp/libivfasterudot.so). The int8
+  # tier prefers it over core's per-call path, which allocates a MemorySegment wrapper per candidate.
+  if os.environ.get("IVFASTER_UDOT_LIB"):
+    cmd += [f'-Divfaster.udotLib={os.environ["IVFASTER_UDOT_LIB"]}']
+  if os.environ.get("LUCENE_NATIVE_DOT") == "1":
+    cmd += ["-Dlucene.useNativeDotProduct=true", "--enable-native-access=ALL-UNNAMED"]
+    if os.environ.get("LUCENE_NATIVE_LIB_PATH"):
+      cmd += [f'-Djava.library.path={os.environ["LUCENE_NATIVE_LIB_PATH"]}']
   # Lloyd iterations over the corpus. WRITE-TIME: it changes the centroids, hence every assignment.
   if os.environ.get("IVFASTER_LLOYD_ITERS"):
     cmd += [f'-Divfaster.lloydIters={os.environ["IVFASTER_LLOYD_ITERS"]}']
@@ -3778,14 +3886,58 @@ def build_java_base_cmd(checkout):
   # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
   if os.environ.get("IVFASTER_BRUTE_N"):
     cmd += [f'-Divfaster.bruteN={os.environ["IVFASTER_BRUTE_N"]}']
+
+  # The vector admission filter (Hamming kernel filterAtMost) is ON by default -- it measured
+  # 0.889->0.860 ms at nprobe=30 / 1.070->1.017 at nprobe=40, recall bit-identical. IVFASTER_NO_SIMD_ADMIT=1
+  # => -Divfaster.noSimdAdmit=true restores the scalar min-of-four unroll: the CONTROL ARM. Top-k is
+  # unchanged either way (same tightening contract, final histogram cut re-derives the true threshold), so
+  # recall MUST match between arms -- if it moves, the two survivor sets disagree and that is a defect.
+  # IVFASTER_SIMD_ADMIT_BLOCK sets the sub-block size the threshold snapshot governs (default 256).
+  if os.environ.get("IVFASTER_NO_SIMD_ADMIT") == "1":
+    cmd += ["-Divfaster.noSimdAdmit=true"]
+  if os.environ.get("IVFASTER_SIMD_ADMIT_BLOCK"):
+    cmd += [f'-Divfaster.simdAdmitBlock={os.environ["IVFASTER_SIMD_ADMIT_BLOCK"]}']
+
+  # IVFASTER_COARSE_MF=1 => -Divfaster.coarseMf=true: score the coarse scan with the NitroxMF matched
+  # filter instead of sign-Hamming. SEARCH-TIME (reader-only), but REQUIRES a 1-plane index
+  # (IVFASTER_COARSE_BITS=1) since the MF doc side IS that sign plane; on a 2-bit index it is ignored.
+  # A matched filter weights each hyperplane by the query's projection magnitude, so it ranks the SAME
+  # 128 B/doc sign code more sharply than a flat popcount -- half nitrox2's coarse bytes. Recall must be
+  # compared, not assumed equal: it is a different (better-ranked) coarse score, not a faster identical one.
+  # IVFASTER_MF_QUERY_BITS sets the query weight-plane depth (default 2 = eight popcounts, matched to nitrox2).
+  if os.environ.get("IVFASTER_COARSE_MF") == "1":
+    cmd += ["-Divfaster.coarseMf=true"]
+    if os.environ.get("IVFASTER_MF_QUERY_BITS"):
+      cmd += [f'-Divfaster.mfQueryBits={os.environ["IVFASTER_MF_QUERY_BITS"]}']
+
+  # IVFASTER_NO_UDOT=1 => -Divfaster.noUdot=true: force the JAVA int8 rerank even when the native UDOT
+  # library is present. This is the CONTROL ARM -- the native kernel is loaded opportunistically, so
+  # without a way to switch it off there is no way to attribute a latency change to it rather than to
+  # the run. Both arms read the same index and score identically (integer dot is exact), so recall must
+  # come out the same; if it moves, the two paths disagree and that is a defect, not a speedup.
+  if os.environ.get("IVFASTER_NO_UDOT") == "1":
+    cmd += ['-Divfaster.noUdot=true']
+
+  # IVFASTER_UDOT_LIB points at the native kernel when it is not in /tmp.
+  if os.environ.get("IVFASTER_UDOT_LIB"):
+    cmd += [f'-Divfaster.udotLib={os.environ["IVFASTER_UDOT_LIB"]}']
   # Diagnostic: exact centroid scan instead of the graph descent. This is the reference the graph's
   # recall is validated against, not a tuning knob.
   if os.environ.get("IVFASTER_FLAT_SELECT") == "1":
     cmd += ["-Divfaster.flatSelect=true"]
   # Prints docs-scanned/query and which cell-select path ran. Diagnostic only; the counters are what
   # make a per-doc cost comparison against another codec meaningful rather than inferred from nlist.
+  # Caps how many VISITED centroids the fine tier verifies, as a multiple of nprobe. 0 = verify all
+  # (the reference). The descent visits several times ef, so the uncapped verify is ~489 centroids at
+  # nlist=2000/np40 -- a quarter of the index -- to pick ~22 cells.
+  if os.environ.get("IVFASTER_VERIFY_MULT"):
+    cmd += [f'-Divfaster.verifyMultiplier={os.environ["IVFASTER_VERIFY_MULT"]}']
   if os.environ.get("IVFASTER_REPORT") == "1":
     cmd += ["-Divfaster.reportEngagement=true"]
+  # Counts DISTINCT documents among the scanned slots, to measure spill amplification directly rather
+  # than inferring it from spillBits. Adds a full extra pass over every scanned slot -- DIAGNOSTIC ONLY.
+  if os.environ.get("IVFASTER_MEASURE_SPILL") == "1":
+    cmd += ["-Divfaster.measureSpill=true", "-Divfaster.reportEngagement=true"]
   # Rotation-SimHash rounds R = bits per dimension (R*dim/8 bytes/doc; R=8 == osq8's 1 B/dim). Write-time:
   # it sets the on-disk record length, so it is part of the index identity -- a change needs KNN_CLEAR_CACHE=1
   # or the run silently reuses an index encoded at a different R. (Replaces IVF_SIMHASH_BITS, which named the
