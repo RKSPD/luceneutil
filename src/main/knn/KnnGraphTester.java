@@ -1558,6 +1558,24 @@ public class KnnGraphTester implements FormatterLogger {
           suffix.add("nctr0");
         }
       }
+      if ("nibble5".equals(System.getProperty("ivfaster.fineTier"))) {
+        final String clipStd = System.getProperty("ivfaster.nibble5ClipStd", "3.0");
+        if (clipStd.equals("3.0") == false) {
+          suffix.add("n5cs" + clipStd);
+        }
+        if ("false".equals(System.getProperty("ivfaster.nibble5Centre"))) {
+          suffix.add("n5ctr0");
+        }
+      }
+      if ("nibble6".equals(System.getProperty("ivfaster.fineTier"))) {
+        final String clipStd = System.getProperty("ivfaster.nibble6ClipStd", "3.5");
+        if (clipStd.equals("3.5") == false) {
+          suffix.add("n6cs" + clipStd);
+        }
+        if ("false".equals(System.getProperty("ivfaster.nibble6Centre"))) {
+          suffix.add("n6ctr0");
+        }
+      }
       // The COARSE plane count sets how many plane sections exist and how long a coarse code is, so it
       // is as format-defining as the fine tier. Omitted from the key, flipping it would reuse an index
       // whose plane sections the reader then refuses (CorruptIndexException) -- or worse, on a build
@@ -1938,7 +1956,13 @@ public class KnnGraphTester implements FormatterLogger {
       }
 
       long startNS;
-      try (MMapDirectory dir = new MMapDirectory(indexPath)) {
+      // Large mmap chunk so each data file maps as ONE MemorySegment. The default 1 GB chunk chops a
+      // multi-GB .ivfd into per-chunk segments, and MemorySegmentAccessInput.segmentSliceOrNull returns
+      // null for any section spanning a boundary -- which silently disengages the ivfaster SIMD coarse
+      // kernel (falls back to scalar per-row xorBitCount) and forces the rerank gather onto the slow
+      // multi-segment copy path. At 10M (~35 GB index) that fallback was ~28%+19% of query CPU. One
+      // segment per file restores coarseHiSeg/codeTableSeg and the fast paths.
+      try (MMapDirectory dir = new MMapDirectory(indexPath, 1L << 40)) {
         // TODO: hmm dangerous since index isn't necessarily going to fit in RAM?
         dir.setPreload((x, ctx) -> x.endsWith(".vec") || x.endsWith(".veq"));
         try (DirectoryReader reader = DirectoryReader.open(dir)) {
