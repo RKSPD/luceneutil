@@ -148,7 +148,11 @@ if "JAVA_COMMAND" not in globals():
   # can cap RAM without editing this file -- essential for the >RAM experiment (findings.md §20), where
   # the index must exceed the heap to exercise the disk/off-heap path. Default 2g.
   KNN_HEAP = os.environ.get("KNN_HEAP", "2g")
-  JAVA_COMMAND = "%s -server -Xms%s -Xmx%s --add-modules jdk.incubator.vector -XX:+HeapDumpOnOutOfMemoryError -XX:+UseParallelGC" % (JAVA_EXE, KNN_HEAP, KNN_HEAP)
+  # --enable-native-access=ALL-UNNAMED: the ivfaster fine tier can bind a native UDOT kernel via FFM.
+  # Without this the downcall still runs but warns, and the JDK intends to BLOCK restricted methods in a
+  # future release -- at which point the kernel would silently fall back to Java and every latency here
+  # would quietly regress with nothing in the output saying why.
+  JAVA_COMMAND = "%s -server -Xms%s -Xmx%s --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+HeapDumpOnOutOfMemoryError -XX:+UseParallelGC" % (JAVA_EXE, KNN_HEAP, KNN_HEAP)
 
 print("use java command %s" % JAVA_COMMAND)
 

@@ -773,6 +773,10 @@ for _env_name, _param in (
   ("KNN_NQUERY", "nquery"),
   ("KNN_TOPK", "topK"),
   ("KNN_FLUSH_ITERS", "ivfFlushIters"),
+  # gcutAxes defaults to (1,2), a two-value sweep the ivfaster codec ignores -- so an ivfaster run
+  # executes every param combination TWICE (identical SUMMARY lines, queries=2*nquery). Pin it with
+  # KNN_GCUT_AXES=1 to halve an ivfaster sweep's wall-clock. Harmless for gcut runs that want to sweep.
+  ("KNN_GCUT_AXES", "gcutAxes"),
 ):
   _vals = _env_int_tuple(_env_name)
   if _vals:
@@ -2702,6 +2706,33 @@ def run_knn_benchmark(checkout, values, log_path):
   # Lloyd iterations over the corpus. WRITE-TIME: it changes the centroids, hence every assignment.
   if os.environ.get("IVFASTER_LLOYD_ITERS"):
     cmd += [f'-Divfaster.lloydIters={os.environ["IVFASTER_LLOYD_ITERS"]}']
+  # IVFASTER_MIN_SHORTLIST: floor on the coarse shortlist the ASSIGNMENT router exact-verifies (build
+  # only; query routing does not use it). Larger = more coarse survivors verified exactly = better
+  # placement at higher build cost. WRITE-TIME (it changes assignments), so KNN_CLEAR_CACHE=1.
+  if os.environ.get("IVFASTER_MIN_SHORTLIST"):
+    cmd += [f'-Divfaster.minShortlist={os.environ["IVFASTER_MIN_SHORTLIST"]}']
+  # IVFASTER_EXACT_PLACEMENT_AUDIT=1: COUNT how many primaries an exact all-nlist scan would place
+  # differently from the coarse shortlist, without changing the index -- the coarse-retention
+  # diagnostic. Prints "[ivfaster] ... primariesMisplaced=N (frac)" to stderr. Measured 14/1M on the
+  # golden config, which is why there is no correction lever. Needs KNN_CLEAR_CACHE=1 to rebuild.
+  if os.environ.get("IVFASTER_EXACT_PLACEMENT_AUDIT") == "1":
+    cmd += ["-Divfaster.exactPlacementAudit=true"]
+  # IVFASTER_CONVERGENCE_TRACE=1: print per-Lloyd-iteration centroid convergence stats (mean/max
+  # displacement, cells still moving, empty cells) to stderr -- "[ivfaster-converge] iter=k/n ...". The
+  # signal for whether IVFASTER_LLOYD_ITERS is enough. Needs KNN_CLEAR_CACHE=1 to rebuild.
+  if os.environ.get("IVFASTER_CONVERGENCE_TRACE") == "1":
+    cmd += ["-Divfaster.convergenceTrace=true"]
+  # IVFASTER_COARSE_COPY=0: at merge, re-encode non-donor coarse planes from the reconstruction instead
+  # of copying them verbatim (the kill switch for the coarse-copy change). WRITE-TIME.
+  if os.environ.get("IVFASTER_COARSE_COPY") == "0":
+    cmd += ["-Divfaster.coarseCopy=false"]
+  # nibble4 fine-tier grid knobs. WRITE-TIME (every code byte), NOT in the index cache key -> an A/B
+  # REQUIRES KNN_CLEAR_CACHE=1 or a distinct index dir. ClipStd loads the grid to a multiple of the
+  # analytic std (0 = old per-vector max-abs); Centre spends the 4-bit range on the residual not the mean.
+  if os.environ.get("IVFASTER_NIBBLE4_CLIP_STD"):
+    cmd += [f'-Divfaster.nibble4ClipStd={os.environ["IVFASTER_NIBBLE4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_NIBBLE4_CENTRE") == "0":
+    cmd += ["-Divfaster.nibble4Centre=false"]
   # Coarse shortlist handed to the fine tier. SEARCH-TIME, so it sweeps against one cached index and is
   # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
   # IVFASTER_NPROBE_MARGIN prunes selected cells on QUALITY: keep only cells within d1*margin of the
@@ -2734,6 +2765,11 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += ["-Divfaster.coarseMf=true"]
     if os.environ.get("IVFASTER_MF_QUERY_BITS"):
       cmd += [f'-Divfaster.mfQueryBits={os.environ["IVFASTER_MF_QUERY_BITS"]}']
+    # IVFASTER_MF_QUERY_CLIP_Q: percentile the query weight grid clips |projection| at (default 0.995).
+    # SEARCH-TIME reader-only (the query grid is built per query; the doc sign plane is clip-free at 1
+    # bit), so it sweeps against one cached index with no reindex.
+    if os.environ.get("IVFASTER_MF_QUERY_CLIP_Q"):
+      cmd += [f'-Divfaster.mfQueryClipQ={os.environ["IVFASTER_MF_QUERY_CLIP_Q"]}']
 
   # IVFASTER_NO_UDOT=1 => -Divfaster.noUdot=true: force the JAVA int8 rerank even when the native UDOT
   # library is present. This is the CONTROL ARM -- the native kernel is loaded opportunistically, so
@@ -2757,6 +2793,48 @@ def run_knn_benchmark(checkout, values, log_path):
   # nlist=2000/np40 -- a quarter of the index -- to pick ~22 cells.
   if os.environ.get("IVFASTER_VERIFY_MULT"):
     cmd += [f'-Divfaster.verifyMultiplier={os.environ["IVFASTER_VERIFY_MULT"]}']
+  # Centroid-graph search beam ef = max(minEf, nprobe*efMultiplier). SEARCH-TIME (bounds the descent, not
+  # the graph), so both sweep against one cached index. At high nlist nprobe must rise to recover coverage
+  # and ef rises with it, so the descent's centroid-scan cost balloons -- lowering these trims the routing
+  # tax. Pair with a smaller IVFASTER_VERIFY_MULT to cut the fine-verify tax at the same operating point.
+  if os.environ.get("IVFASTER_EF_MULT"):
+    cmd += [f'-Divfaster.efMultiplier={os.environ["IVFASTER_EF_MULT"]}']
+  if os.environ.get("IVFASTER_MIN_EF"):
+    cmd += [f'-Divfaster.minEf={os.environ["IVFASTER_MIN_EF"]}']
+  # Centroid-graph SHAPE. WRITE-TIME (both are baked into the persisted edges/record layout), so each
+  # value reindexes -- graphM is in the index cache key so a leaner-M build cannot silently reuse the
+  # M=16 graph. graphM cuts neighbours chased per expansion (the descent's pointer-chasing bound) and
+  # shortens the node record; efConstruction cheapens the build and, with a smaller M, is the other half
+  # of a leaner graph. Lower graphM trades navigability for scan cost; the exact rerank absorbs some loss.
+  if os.environ.get("IVFASTER_GRAPH_M"):
+    cmd += [f'-Divfaster.graphM={os.environ["IVFASTER_GRAPH_M"]}']
+  if os.environ.get("IVFASTER_EF_CONSTRUCTION"):
+    cmd += [f'-Divfaster.efConstruction={os.environ["IVFASTER_EF_CONSTRUCTION"]}']
+  # IVFASTER_COARSE_COPY=0 => -Divfaster.coarseCopy=false: kill switch for the merge coarse-plane copy,
+  # reverting to re-encoding every plane from the lossy reconstruction (pre-change behaviour). WRITE-TIME
+  # (it changes the persisted coarse planes) and NOT in the index cache key, so an A/B REQUIRES
+  # KNN_CLEAR_CACHE=1 (or a distinct index dir) or the second arm silently reuses the first's index.
+  if os.environ.get("IVFASTER_COARSE_COPY") == "0":
+    cmd += ["-Divfaster.coarseCopy=false"]
+  # nibble4 fine-tier grid knobs. WRITE-TIME (every code byte), NOT in the index cache key -> an A/B
+  # REQUIRES KNN_CLEAR_CACHE=1 or a distinct index dir. ClipStd loads the grid to a multiple of the
+  # analytic std (0 = old per-vector max-abs); Centre spends the 4-bit range on the residual not the mean.
+  if os.environ.get("IVFASTER_NIBBLE4_CLIP_STD"):
+    cmd += [f'-Divfaster.nibble4ClipStd={os.environ["IVFASTER_NIBBLE4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_NIBBLE4_CENTRE") == "0":
+    cmd += ["-Divfaster.nibble4Centre=false"]
+  # IVFASTER_MIN_SHORTLIST overrides the build-time assignment shortlist floor (default 32). WRITE-TIME,
+  # NOT in the index cache key -> sweep with KNN_CLEAR_CACHE=1.
+  if os.environ.get("IVFASTER_MIN_SHORTLIST"):
+    cmd += [f'-Divfaster.minShortlist={os.environ["IVFASTER_MIN_SHORTLIST"]}']
+  # IVFASTER_GLOBAL_SCOPE=1 => -Divfaster.globalScope=true: rebind the mmap'd coarse/code segments to the
+  # GLOBAL scope at open so the per-vector-load session-liveness check folds away (JFR: ~15% of query CPU).
+  # SEARCH-TIME (reader-only, no reindex) -- A/B on the same cached index. Recall MUST be bit-identical
+  # (same bytes, same scoring); only latency may move. Off by default: it trades a thrown
+  # IllegalStateException on use-after-close for a SIGSEGV, safe only because these segments live as long
+  # as the reader.
+  if os.environ.get("IVFASTER_GLOBAL_SCOPE") == "1":
+    cmd += ["-Divfaster.globalScope=true"]
   if os.environ.get("IVFASTER_REPORT") == "1":
     cmd += ["-Divfaster.reportEngagement=true"]
   # Counts DISTINCT documents among the scanned slots, to measure spill amplification directly rather
@@ -3882,6 +3960,33 @@ def build_java_base_cmd(checkout):
   # Lloyd iterations over the corpus. WRITE-TIME: it changes the centroids, hence every assignment.
   if os.environ.get("IVFASTER_LLOYD_ITERS"):
     cmd += [f'-Divfaster.lloydIters={os.environ["IVFASTER_LLOYD_ITERS"]}']
+  # IVFASTER_MIN_SHORTLIST: floor on the coarse shortlist the ASSIGNMENT router exact-verifies (build
+  # only; query routing does not use it). Larger = more coarse survivors verified exactly = better
+  # placement at higher build cost. WRITE-TIME (it changes assignments), so KNN_CLEAR_CACHE=1.
+  if os.environ.get("IVFASTER_MIN_SHORTLIST"):
+    cmd += [f'-Divfaster.minShortlist={os.environ["IVFASTER_MIN_SHORTLIST"]}']
+  # IVFASTER_EXACT_PLACEMENT_AUDIT=1: COUNT how many primaries an exact all-nlist scan would place
+  # differently from the coarse shortlist, without changing the index -- the coarse-retention
+  # diagnostic. Prints "[ivfaster] ... primariesMisplaced=N (frac)" to stderr. Measured 14/1M on the
+  # golden config, which is why there is no correction lever. Needs KNN_CLEAR_CACHE=1 to rebuild.
+  if os.environ.get("IVFASTER_EXACT_PLACEMENT_AUDIT") == "1":
+    cmd += ["-Divfaster.exactPlacementAudit=true"]
+  # IVFASTER_CONVERGENCE_TRACE=1: print per-Lloyd-iteration centroid convergence stats (mean/max
+  # displacement, cells still moving, empty cells) to stderr -- "[ivfaster-converge] iter=k/n ...". The
+  # signal for whether IVFASTER_LLOYD_ITERS is enough. Needs KNN_CLEAR_CACHE=1 to rebuild.
+  if os.environ.get("IVFASTER_CONVERGENCE_TRACE") == "1":
+    cmd += ["-Divfaster.convergenceTrace=true"]
+  # IVFASTER_COARSE_COPY=0: at merge, re-encode non-donor coarse planes from the reconstruction instead
+  # of copying them verbatim (the kill switch for the coarse-copy change). WRITE-TIME.
+  if os.environ.get("IVFASTER_COARSE_COPY") == "0":
+    cmd += ["-Divfaster.coarseCopy=false"]
+  # nibble4 fine-tier grid knobs. WRITE-TIME (every code byte), NOT in the index cache key -> an A/B
+  # REQUIRES KNN_CLEAR_CACHE=1 or a distinct index dir. ClipStd loads the grid to a multiple of the
+  # analytic std (0 = old per-vector max-abs); Centre spends the 4-bit range on the residual not the mean.
+  if os.environ.get("IVFASTER_NIBBLE4_CLIP_STD"):
+    cmd += [f'-Divfaster.nibble4ClipStd={os.environ["IVFASTER_NIBBLE4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_NIBBLE4_CENTRE") == "0":
+    cmd += ["-Divfaster.nibble4Centre=false"]
   # Coarse shortlist handed to the fine tier. SEARCH-TIME, so it sweeps against one cached index and is
   # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
   if os.environ.get("IVFASTER_BRUTE_N"):
@@ -3909,6 +4014,11 @@ def build_java_base_cmd(checkout):
     cmd += ["-Divfaster.coarseMf=true"]
     if os.environ.get("IVFASTER_MF_QUERY_BITS"):
       cmd += [f'-Divfaster.mfQueryBits={os.environ["IVFASTER_MF_QUERY_BITS"]}']
+    # IVFASTER_MF_QUERY_CLIP_Q: percentile the query weight grid clips |projection| at (default 0.995).
+    # SEARCH-TIME reader-only (the query grid is built per query; the doc sign plane is clip-free at 1
+    # bit), so it sweeps against one cached index with no reindex.
+    if os.environ.get("IVFASTER_MF_QUERY_CLIP_Q"):
+      cmd += [f'-Divfaster.mfQueryClipQ={os.environ["IVFASTER_MF_QUERY_CLIP_Q"]}']
 
   # IVFASTER_NO_UDOT=1 => -Divfaster.noUdot=true: force the JAVA int8 rerank even when the native UDOT
   # library is present. This is the CONTROL ARM -- the native kernel is loaded opportunistically, so
@@ -3932,6 +4042,48 @@ def build_java_base_cmd(checkout):
   # nlist=2000/np40 -- a quarter of the index -- to pick ~22 cells.
   if os.environ.get("IVFASTER_VERIFY_MULT"):
     cmd += [f'-Divfaster.verifyMultiplier={os.environ["IVFASTER_VERIFY_MULT"]}']
+  # Centroid-graph search beam ef = max(minEf, nprobe*efMultiplier). SEARCH-TIME (bounds the descent, not
+  # the graph), so both sweep against one cached index. At high nlist nprobe must rise to recover coverage
+  # and ef rises with it, so the descent's centroid-scan cost balloons -- lowering these trims the routing
+  # tax. Pair with a smaller IVFASTER_VERIFY_MULT to cut the fine-verify tax at the same operating point.
+  if os.environ.get("IVFASTER_EF_MULT"):
+    cmd += [f'-Divfaster.efMultiplier={os.environ["IVFASTER_EF_MULT"]}']
+  if os.environ.get("IVFASTER_MIN_EF"):
+    cmd += [f'-Divfaster.minEf={os.environ["IVFASTER_MIN_EF"]}']
+  # Centroid-graph SHAPE. WRITE-TIME (both are baked into the persisted edges/record layout), so each
+  # value reindexes -- graphM is in the index cache key so a leaner-M build cannot silently reuse the
+  # M=16 graph. graphM cuts neighbours chased per expansion (the descent's pointer-chasing bound) and
+  # shortens the node record; efConstruction cheapens the build and, with a smaller M, is the other half
+  # of a leaner graph. Lower graphM trades navigability for scan cost; the exact rerank absorbs some loss.
+  if os.environ.get("IVFASTER_GRAPH_M"):
+    cmd += [f'-Divfaster.graphM={os.environ["IVFASTER_GRAPH_M"]}']
+  if os.environ.get("IVFASTER_EF_CONSTRUCTION"):
+    cmd += [f'-Divfaster.efConstruction={os.environ["IVFASTER_EF_CONSTRUCTION"]}']
+  # IVFASTER_COARSE_COPY=0 => -Divfaster.coarseCopy=false: kill switch for the merge coarse-plane copy,
+  # reverting to re-encoding every plane from the lossy reconstruction (pre-change behaviour). WRITE-TIME
+  # (it changes the persisted coarse planes) and NOT in the index cache key, so an A/B REQUIRES
+  # KNN_CLEAR_CACHE=1 (or a distinct index dir) or the second arm silently reuses the first's index.
+  if os.environ.get("IVFASTER_COARSE_COPY") == "0":
+    cmd += ["-Divfaster.coarseCopy=false"]
+  # nibble4 fine-tier grid knobs. WRITE-TIME (every code byte), NOT in the index cache key -> an A/B
+  # REQUIRES KNN_CLEAR_CACHE=1 or a distinct index dir. ClipStd loads the grid to a multiple of the
+  # analytic std (0 = old per-vector max-abs); Centre spends the 4-bit range on the residual not the mean.
+  if os.environ.get("IVFASTER_NIBBLE4_CLIP_STD"):
+    cmd += [f'-Divfaster.nibble4ClipStd={os.environ["IVFASTER_NIBBLE4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_NIBBLE4_CENTRE") == "0":
+    cmd += ["-Divfaster.nibble4Centre=false"]
+  # IVFASTER_MIN_SHORTLIST overrides the build-time assignment shortlist floor (default 32). WRITE-TIME,
+  # NOT in the index cache key -> sweep with KNN_CLEAR_CACHE=1.
+  if os.environ.get("IVFASTER_MIN_SHORTLIST"):
+    cmd += [f'-Divfaster.minShortlist={os.environ["IVFASTER_MIN_SHORTLIST"]}']
+  # IVFASTER_GLOBAL_SCOPE=1 => -Divfaster.globalScope=true: rebind the mmap'd coarse/code segments to the
+  # GLOBAL scope at open so the per-vector-load session-liveness check folds away (JFR: ~15% of query CPU).
+  # SEARCH-TIME (reader-only, no reindex) -- A/B on the same cached index. Recall MUST be bit-identical
+  # (same bytes, same scoring); only latency may move. Off by default: it trades a thrown
+  # IllegalStateException on use-after-close for a SIGSEGV, safe only because these segments live as long
+  # as the reader.
+  if os.environ.get("IVFASTER_GLOBAL_SCOPE") == "1":
+    cmd += ["-Divfaster.globalScope=true"]
   if os.environ.get("IVFASTER_REPORT") == "1":
     cmd += ["-Divfaster.reportEngagement=true"]
   # Counts DISTINCT documents among the scanned slots, to measure spill amplification directly rather

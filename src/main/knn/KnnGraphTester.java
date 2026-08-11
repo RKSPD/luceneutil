@@ -1543,9 +1543,53 @@ public class KnnGraphTester implements FormatterLogger {
       if (ivfSpillBits > 0 && ivfSoarLambda > 0) {
         suffix.add("soar" + ivfSoarLambda);
       }
-      suffix.add("it" + System.getProperty("ivfaster.lloydIters", "3"));
+      suffix.add("it" + System.getProperty("ivfaster.lloydIters", "10"));
       // The fine tier changes every code byte, so it belongs in the key.
       suffix.add("fine" + System.getProperty("ivfaster.fineTier", "int8"));
+      // nibble4 grid knobs are write-time (every code byte) -- in the key so a sweep auto-builds a fresh
+      // dir per value instead of silently reusing another variant's codes. Emitted only for nibble4 and
+      // only when non-default, so int8/nitroxA8 index names are unchanged.
+      if ("nibble4".equals(System.getProperty("ivfaster.fineTier"))) {
+        final String clipStd = System.getProperty("ivfaster.nibble4ClipStd", "2.5");
+        if (clipStd.equals("2.5") == false) {
+          suffix.add("ncs" + clipStd);
+        }
+        if ("false".equals(System.getProperty("ivfaster.nibble4Centre"))) {
+          suffix.add("nctr0");
+        }
+      }
+      // The COARSE plane count sets how many plane sections exist and how long a coarse code is, so it
+      // is as format-defining as the fine tier. Omitted from the key, flipping it would reuse an index
+      // whose plane sections the reader then refuses (CorruptIndexException) -- or worse, on a build
+      // without that guard, misread every record. Only emitted when non-default, to keep existing
+      // cached index names valid.
+      // Spill margin decides which documents spill, so it changes the index contents.
+      final String spillMargin = System.getProperty("ivfaster.spillMargin", "1.10");
+      if (spillMargin.equals("1.10") == false) {
+        suffix.add("sm" + spillMargin);
+      }
+      final String coarseBits = System.getProperty("ivfaster.coarseBits", "2");
+      if (coarseBits.equals("2") == false) {
+        suffix.add("cb" + coarseBits);
+      }
+      // Centroid-graph neighbour bound M is baked into the node record layout (stride) and the persisted
+      // edges. The reader sizes its per-expansion fan scratch to the static M, so reusing a wider graph
+      // under a smaller M would misread; smaller-then-larger would under-explore. Either way it must be in
+      // the key. Only emitted when non-default so existing cached index names stay valid.
+      final String graphM = System.getProperty("ivfaster.graphM", "16");
+      if (graphM.equals("16") == false) {
+        suffix.add("gm" + graphM);
+      }
+      // efConstruction shapes which edges get chosen; not layout-defining, but a different value is a
+      // different graph, so a sweep must not reuse across it.
+      final String efc = System.getProperty("ivfaster.efConstruction", "64");
+      if (efc.equals("64") == false) {
+        suffix.add("efc" + efc);
+      }
+      // Centring changes every fine code byte AND whether a mean is persisted at all.
+      if (Boolean.getBoolean("ivfaster.int8Centre")) {
+        suffix.add("ctr");
+      }
     } else if (indexType == IndexType.LLOYD_IVF) {
       // Minimal Lloyd IVF. nlist/spillBits/soar/kmeans are baked into the on-disk index. nprobe is a
       // pure search-time scan budget: the reader honors a -Dlloyd.nprobe override (set above from
@@ -3160,7 +3204,7 @@ public class KnnGraphTester implements FormatterLogger {
           // changes the bytes on disk -- nlist, spillBits, soarLambda, lloydIters, the fine tier -- is
           // in the key. Five voided runs in this project came from a write-time knob that was not.
           final int ivfasterIters =
-              Integer.parseInt(System.getProperty("ivfaster.lloydIters", "3"));
+              Integer.parseInt(System.getProperty("ivfaster.lloydIters", "10"));
           final KnnVectorsFormat ivfasterFormat =
               new IVFasterVectorsFormat(
                   ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfasterIters);
