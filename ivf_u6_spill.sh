@@ -1,0 +1,18 @@
+#!/bin/zsh
+set -e
+cd /local/home/rikhil/vectordb/luceneutil
+source .venv/bin/activate
+export KNN_HEAP=16g KNN_INDEX_TYPE=ivfaster IVFASTER_FINE_TIER=udot6 \
+  IVFASTER_COARSE_BITS=1 IVFASTER_COARSE_MF=1 \
+  KNN_NDOC=1000000 KNN_NLIST=8000 IVFASTER_BRUTE_N=800 \
+  IVFASTER_VERIFY_MULT=2 IVFASTER_NPROBE_MARGIN=0.75 \
+  IVFASTER_GRAPH_M=16 IVFASTER_EF_CONSTRUCTION=64 KNN_GCUT_AXES=1 IVFASTER_REPORT=1 \
+  IVFASTER_MF_QUERY_CLIP_Q=0.95 IVFASTER_UDOT_LIB=/tmp/libivfasterudot.so
+# Higher spill (write-time -> rebuild per sm). bn800 fixed; find the nprobe knee at each margin.
+for SM in 1.80 2.00; do
+  for NP in 45 50 55; do
+    echo "=== sm$SM bn800 np=$NP ==="
+    IVFASTER_SPILL_MARGIN=$SM KNN_NPROBE=$NP python -u src/python/knnPerfTest.py 2>&1 | grep -iE "^SUMMARY:" | tail -1
+  done
+done
+echo U6SPILLDONE

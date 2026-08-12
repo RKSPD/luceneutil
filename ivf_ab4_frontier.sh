@@ -1,0 +1,13 @@
+#!/bin/zsh
+set -e
+cd /local/home/rikhil/vectordb/luceneutil
+source .venv/bin/activate
+# Frontier operating point: nl8000 np60 sm1.60 vm2 adaptiveMargin0.75 bruteN600, cb1 + coarseMf, native udot.
+export KNN_HEAP=16g KNN_INDEX_TYPE=ivfaster IVFASTER_FINE_TIER=afterburner4 \
+  IVFASTER_COARSE_BITS=1 IVFASTER_COARSE_MF=1 \
+  KNN_NDOC=1000000 KNN_NLIST=8000 IVFASTER_SPILL_MARGIN=1.60 IVFASTER_BRUTE_N=600 \
+  KNN_NPROBE=60 IVFASTER_VERIFY_MULT=2 IVFASTER_NPROBE_MARGIN=0.75 \
+  IVFASTER_GRAPH_M=16 IVFASTER_EF_CONSTRUCTION=64 KNN_GCUT_AXES=1 IVFASTER_REPORT=1 \
+  IVFASTER_MF_QUERY_CLIP_Q=0.95
+python -u src/python/knnPerfTest.py 2>&1 | grep -iE "will now reindex|graphDescents|^SUMMARY:" | tail -6
+echo AB4FRONTIERDONE

@@ -2741,6 +2741,14 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f'-Divfaster.nibble6ClipStd={os.environ["IVFASTER_NIBBLE6_CLIP_STD"]}']
   if os.environ.get("IVFASTER_NIBBLE6_CENTRE") == "0":
     cmd += ["-Divfaster.nibble6Centre=false"]
+  if os.environ.get("IVFASTER_AFTERBURNER4_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner4ClipStd={os.environ["IVFASTER_AFTERBURNER4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER5_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner5ClipStd={os.environ["IVFASTER_AFTERBURNER5_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER6_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner6ClipStd={os.environ["IVFASTER_AFTERBURNER6_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER8_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner8ClipStd={os.environ["IVFASTER_AFTERBURNER8_CLIP_STD"]}']
   # Coarse shortlist handed to the fine tier. SEARCH-TIME, so it sweeps against one cached index and is
   # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
   # IVFASTER_NPROBE_MARGIN prunes selected cells on QUALITY: keep only cells within d1*margin of the
@@ -2839,6 +2847,14 @@ def run_knn_benchmark(checkout, values, log_path):
     cmd += [f'-Divfaster.nibble6ClipStd={os.environ["IVFASTER_NIBBLE6_CLIP_STD"]}']
   if os.environ.get("IVFASTER_NIBBLE6_CENTRE") == "0":
     cmd += ["-Divfaster.nibble6Centre=false"]
+  if os.environ.get("IVFASTER_AFTERBURNER4_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner4ClipStd={os.environ["IVFASTER_AFTERBURNER4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER5_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner5ClipStd={os.environ["IVFASTER_AFTERBURNER5_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER6_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner6ClipStd={os.environ["IVFASTER_AFTERBURNER6_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER8_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner8ClipStd={os.environ["IVFASTER_AFTERBURNER8_CLIP_STD"]}']
   # IVFASTER_MIN_SHORTLIST overrides the build-time assignment shortlist floor (default 32). WRITE-TIME,
   # NOT in the index cache key -> sweep with KNN_CLEAR_CACHE=1.
   if os.environ.get("IVFASTER_MIN_SHORTLIST"):
@@ -4011,6 +4027,14 @@ def build_java_base_cmd(checkout):
     cmd += [f'-Divfaster.nibble6ClipStd={os.environ["IVFASTER_NIBBLE6_CLIP_STD"]}']
   if os.environ.get("IVFASTER_NIBBLE6_CENTRE") == "0":
     cmd += ["-Divfaster.nibble6Centre=false"]
+  if os.environ.get("IVFASTER_AFTERBURNER4_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner4ClipStd={os.environ["IVFASTER_AFTERBURNER4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER5_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner5ClipStd={os.environ["IVFASTER_AFTERBURNER5_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER6_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner6ClipStd={os.environ["IVFASTER_AFTERBURNER6_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER8_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner8ClipStd={os.environ["IVFASTER_AFTERBURNER8_CLIP_STD"]}']
   # Coarse shortlist handed to the fine tier. SEARCH-TIME, so it sweeps against one cached index and is
   # deliberately NOT in the key -- it is half of the latency-at-recall curve (nprobe is the other half).
   if os.environ.get("IVFASTER_BRUTE_N"):
@@ -4104,6 +4128,14 @@ def build_java_base_cmd(checkout):
     cmd += [f'-Divfaster.nibble6ClipStd={os.environ["IVFASTER_NIBBLE6_CLIP_STD"]}']
   if os.environ.get("IVFASTER_NIBBLE6_CENTRE") == "0":
     cmd += ["-Divfaster.nibble6Centre=false"]
+  if os.environ.get("IVFASTER_AFTERBURNER4_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner4ClipStd={os.environ["IVFASTER_AFTERBURNER4_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER5_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner5ClipStd={os.environ["IVFASTER_AFTERBURNER5_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER6_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner6ClipStd={os.environ["IVFASTER_AFTERBURNER6_CLIP_STD"]}']
+  if os.environ.get("IVFASTER_AFTERBURNER8_CLIP_STD"):
+    cmd += [f'-Divfaster.afterburner8ClipStd={os.environ["IVFASTER_AFTERBURNER8_CLIP_STD"]}']
   # IVFASTER_MIN_SHORTLIST overrides the build-time assignment shortlist floor (default 32). WRITE-TIME,
   # NOT in the index cache key -> sweep with KNN_CLEAR_CACHE=1.
   if os.environ.get("IVFASTER_MIN_SHORTLIST"):

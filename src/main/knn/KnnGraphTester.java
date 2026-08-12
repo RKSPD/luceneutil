@@ -1576,6 +1576,31 @@ public class KnnGraphTester implements FormatterLogger {
           suffix.add("n6ctr0");
         }
       }
+      if ("afterburner4".equals(System.getProperty("ivfaster.fineTier"))) {
+        final String clipStd = System.getProperty("ivfaster.afterburner4ClipStd", "3.5");
+        if (clipStd.equals("3.5") == false) {
+          suffix.add("ab4cs" + clipStd);
+        }
+      }
+      final String fineTier5 = System.getProperty("ivfaster.fineTier");
+      if ("afterburner5".equals(fineTier5) || "afterburner5inline".equals(fineTier5)) {
+        final String clipStd = System.getProperty("ivfaster.afterburner5ClipStd", "3.5");
+        if (clipStd.equals("3.5") == false) {
+          suffix.add("ab5cs" + clipStd);
+        }
+      }
+      if ("afterburner6".equals(System.getProperty("ivfaster.fineTier"))) {
+        final String clipStd = System.getProperty("ivfaster.afterburner6ClipStd", "3.5");
+        if (clipStd.equals("3.5") == false) {
+          suffix.add("ab6cs" + clipStd);
+        }
+      }
+      if ("afterburner8".equals(System.getProperty("ivfaster.fineTier"))) {
+        final String clipStd = System.getProperty("ivfaster.afterburner8ClipStd", "4.0");
+        if (clipStd.equals("4.0") == false) {
+          suffix.add("ab8cs" + clipStd);
+        }
+      }
       // The COARSE plane count sets how many plane sections exist and how long a coarse code is, so it
       // is as format-defining as the fine tier. Omitted from the key, flipping it would reuse an index
       // whose plane sections the reader then refuses (CorruptIndexException) -- or worse, on a build
