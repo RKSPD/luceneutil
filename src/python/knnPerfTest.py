@@ -151,29 +151,55 @@ NOISY = True
 # TODO
 #  - can we expose greediness (global vs local queue exploration in KNN search) here?
 
-# test parameters. This script will run KnnGraphTester on every combination of these parameters
+# test parameters. This script will run KnnGraphTester on every combination of these parameters.
+#
+# indexType selects the vector codec: "hnsw" (default), "flat", or "ivfaster" (custom IVF codec,
+# sandbox IVFasterVectorsFormat). The ivf* params near the bottom are read ONLY when indexType is
+# "ivfaster"; on the hnsw/flat paths getCodec ignores them, so they sit in the sweep harmlessly
+# (keep them single-valued so they don't multiply the hnsw combo count). To run ivfaster, set
+# indexType to "ivfaster" (and typically ndoc=1_000_000, numSearchThread=0 for the frontier).
 PARAMS = {
-  "ndoc": (500_000,),
+  "ndoc": (1_000_000,),
+  "indexType": ("ivfaster",),            # hnsw | flat | ivfaster
   "maxConn": (64,),
   "beamWidthIndex": (250,),
   "fanout": (100,),
   "numMergeWorker": (24,),
   "numMergeThread": (8,),
-  "numSearchThread": (4,),
+  "numSearchThread": (0,),
   "encoding": ("float32",),
   "metric": ("dot_product",),
-  "quantizeBits": (1, 2, 4),
-  "overSample": (
-    1,
-    2,
-    5,
-  ),
+  # HNSW-only sweep knobs. ivfaster ignores them for the KNN field, but they still (a) build a
+  # redundant knn-rerank HNSW graph when rerank=True and (b) multiply the index-key/combo count
+  # (quantizeBits/rerank/rerankQuantizeBits each go into the index key => extra full reindexes).
+  # So single-value them for an ivfaster run; restore the multi-value HNSW sweep below for indexType=hnsw.
+  "quantizeBits": (1,),              # HNSW sweep: (1, 2, 4)
+  "overSample": (1,),               # HNSW sweep: (1, 2, 5)
   "topK": (100,),
   "quantizeCompress": (True,),
   "forceMerge": (True,),
-  "nquery": (10000,),
-  "rerank": (True, False),
-  "rerankQuantizeBits": (32, 8, 4),
+  "nquery": (1000,),
+  "rerank": (False,),               # HNSW sweep: (True, False). False avoids the 1M x 1024d rerank HNSW graph.
+  "rerankQuantizeBits": (32,),      # HNSW sweep: (32, 8, 4)
+  # ---- ivfaster: read only when indexType == "ivfaster"; inert (ignored by getCodec) otherwise ----
+  # Seeded near the Graviton3 recall@100 frontier. The 0.951@~0.68ms headline used the full research
+  # codec (1-bit coarse + matched filter + native udot + udot6); this release branch ships 2-bit
+  # Nitrox2 coarse + the int8 fine tier, so its int8 frontier is nearer 0.952 @ ~0.72-0.74 ms.
+  # write-time knobs (each distinct value reindexes):
+  "ivfNlist": (8000,),
+  "ivfSpillBits": (3,),              # sp3: coverage from fewer probed cells -> lower nprobe
+  "ivfSpillMargin": (1.40,),         # tighten to 1.40 at sp3 (default 1.10 overspills)
+  "ivfSoarLambda": (1.0,),
+  "ivfLloydIters": (10,),
+  "ivfCoarseTier": ("nitrox2",),     # nitrox2
+  "ivfFineTier": ("int8",),          # int8 | fp32
+  # "ivfKeepFullPrecision": (True,),  # also store raw fp32 (int8 tier only)
+  # search-time knobs (no reindex -- swept against one cached index; sweep the frontier here):
+  "ivfNprobe": (8, 16, 24, 32, 64, 96),               # wide sweep to regenerate e2e recall bands
+  "ivfBruteN": (700,),               # bruteN saturates ~800
+  "ivfNprobeMargin": (0.75,),        # probe wide (np45), prune on quality (m0.75)
+  "ivfVerifyMultiplier": (2,),
+  # "ivfVerifyMin": (64,),
 }
 
 
@@ -461,8 +487,8 @@ def print_run_summary(values):
   fixed = []
   combos = 1
 
-  # print these important params first, in this order:
-  print_order = ["forceMerge", "ndoc", "nquery", "topK", "quantizeBits"]
+  # print these important params first, in this order (only those actually present in this run):
+  print_order = [k for k in ["forceMerge", "ndoc", "nquery", "topK", "quantizeBits"] if k in values]
   key_to_ord = {}
   other_keys = []
 
@@ -1205,8 +1231,10 @@ def run_knn_benchmark(checkout, values, log_path):
 
   if v3:
     dim = 1024
-    doc_vectors = "/lucenedata/enwiki/cohere-v3/cohere-v3-wikipedia-en-scattered-1024d.docs.vec"
-    query_vectors = "/lucenedata/enwiki/cohere-v3/cohere-v3-wikipedia-en-scattered-1024d.queries.vec"
+    # local copy under $BASE_DIR/data (the /lucenedata/enwiki/cohere-v3/...scattered... paths are the
+    # shared-fleet location and are not present on this box):
+    doc_vectors = f"{constants.BASE_DIR}/data/cohere-v3-wikipedia-en-1024d.docs.en-full.vec"
+    query_vectors = f"{constants.BASE_DIR}/data/cohere-v3-wikipedia-en-1024d.queries.1in24-articles.vec"
   else:
     dim = 768
     doc_vectors = f"/lucenedata/enwiki/cohere-wikipedia-docs-{dim}d.vec"

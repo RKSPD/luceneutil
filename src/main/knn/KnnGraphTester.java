@@ -56,6 +56,7 @@ import org.apache.lucene.codecs.lucene104.Lucene104HnswScalarQuantizedVectorsFor
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader;
+import org.apache.lucene.sandbox.codecs.ivfaster.IVFasterVectorsFormat;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
@@ -144,7 +145,10 @@ public class KnnGraphTester implements FormatterLogger {
 
   enum IndexType {
     HNSW,
-    FLAT
+    FLAT,
+    // ivfaster: custom IVF float-vector codec (sandbox IVFasterVectorsFormat), selected via
+    // -indexType ivfaster. Uses the -ivf* params; ignores the HNSW/quantize knobs.
+    IVFASTER
   }
 
   enum SearchType {
@@ -217,6 +221,19 @@ public class KnnGraphTester implements FormatterLogger {
   private boolean useBp;
   // index type, e.g. flat, hnsw
   private IndexType indexType;
+  // ivfaster: custom IVF float-vector codec (org.apache.lucene.sandbox.codecs.ivfaster.IVFasterVectorsFormat),
+  // selected via -indexType ivfaster (see IndexType.IVFASTER). These params are read only on that path.
+  // --- write-time (baked into the index; part of the index cache key) ---
+  private int ivfNlist = IVFasterVectorsFormat.DEFAULT_NLIST;            // Lloyd clusters / posting lists
+  private int ivfSpillBits = IVFasterVectorsFormat.DEFAULT_SPILL_BITS;   // SOAR spill: extra cells each doc is written into
+  private float ivfSpillMargin = 1.10f;                                  // boundary margin for spill/Reaper (ivfaster.spillMargin)
+  private float ivfSoarLambda = IVFasterVectorsFormat.DEFAULT_SOAR_LAMBDA; // SOAR spill-selection weight
+  private int ivfLloydIters = IVFasterVectorsFormat.DEFAULT_LLOYD_ITERS; // Lloyd iterations over the corpus
+  private String ivfCoarseTier = "nitrox2";                              // coarse tier: nitrox2
+  private String ivfFineTier = "int8";                                   // fine/rerank tier: int8 | fp32
+  private boolean ivfKeepFullPrecision;                                  // also store raw fp32 vectors (int8/udot6 only)
+  // --- search-time (NOT part of the index key; sweepable against a cached index via -Divfaster.* props) ---
+  private int ivfNprobe = IVFasterVectorsFormat.DEFAULT_NPROBE;          // cells scanned per query
   // oversampling, e.g. the multiple * k to gather before checking recall
   private float overSample;
   // whether to use two-phase reranking: HNSW retrieves overSample*topK candidates, then
@@ -334,8 +351,11 @@ public class KnnGraphTester implements FormatterLogger {
             case "flat":
               indexType = IndexType.FLAT;
               break;
+            case "ivfaster":
+              indexType = IndexType.IVFASTER;
+              break;
             default:
-              throw new IllegalArgumentException("-indexType can be 'hnsw' or 'flat' only");
+              throw new IllegalArgumentException("-indexType can be 'hnsw', 'flat' or 'ivfaster' only");
           }
           break;
         case "-overSample":
@@ -576,6 +596,54 @@ public class KnnGraphTester implements FormatterLogger {
         case "-decay":
           decay = Float.parseFloat(args[++iarg]);
           break;
+        // ---- ivfaster (custom IVF codec, selected via -indexType ivfaster) ----
+        // write-time params (change these => reindex):
+        case "-ivfNlist":
+          ivfNlist = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfSpillBits":
+          ivfSpillBits = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfSpillMargin":
+          // write-time (ivfaster.spillMargin, read by the writer at class-load): set here during
+          // arg parsing, before any ivfaster writer class loads (indexing happens later).
+          ivfSpillMargin = Float.parseFloat(args[++iarg]);
+          System.setProperty("ivfaster.spillMargin", Float.toString(ivfSpillMargin));
+          break;
+        case "-ivfSoarLambda":
+          ivfSoarLambda = Float.parseFloat(args[++iarg]);
+          break;
+        case "-ivfLloydIters":
+          ivfLloydIters = Integer.parseInt(args[++iarg]);
+          break;
+        case "-ivfCoarseTier":
+          ivfCoarseTier = args[++iarg].toLowerCase(Locale.ROOT).trim();
+          break;
+        case "-ivfFineTier":
+          ivfFineTier = args[++iarg].toLowerCase(Locale.ROOT).trim();
+          break;
+        case "-ivfKeepFullPrecision":
+          ivfKeepFullPrecision = true;
+          break;
+        // search-time params (no reindex): pushed to the codec via system properties the
+        // IVFaster reader reads at class-load time.  Set here, during arg parsing, before any
+        // ivfaster reader class is loaded (which happens later, at search time).
+        case "-ivfNprobe":
+          ivfNprobe = Integer.parseInt(args[++iarg]);
+          System.setProperty("ivfaster.nprobe", Integer.toString(ivfNprobe));
+          break;
+        case "-ivfBruteN":
+          System.setProperty("ivfaster.bruteN", args[++iarg]);
+          break;
+        case "-ivfNprobeMargin":
+          System.setProperty("ivfaster.nprobeMargin", args[++iarg]);
+          break;
+        case "-ivfVerifyMultiplier":
+          System.setProperty("ivfaster.verifyMultiplier", args[++iarg]);
+          break;
+        case "-ivfVerifyMin":
+          System.setProperty("ivfaster.verifyMin", args[++iarg]);
+          break;
         default:
           throw new IllegalArgumentException("unknown argument " + arg);
           // usage();
@@ -611,7 +679,9 @@ public class KnnGraphTester implements FormatterLogger {
                                      quantize, quantizeBits, quantizeCompress,
                                      rerank, rerankQuantizeBits,
                                      parentJoin, filterStrategy, filterSelectivity, randomSeed,
-                                     docVectorsPath, numDocs, metric, forceMerge);
+                                     docVectorsPath, numDocs, metric, forceMerge,
+                                     ivfNlist, ivfSpillBits, ivfSpillMargin, ivfSoarLambda,
+                                     ivfLloydIters, ivfCoarseTier, ivfFineTier, ivfKeepFullPrecision);
     log("index key = %s\n", indexKey);
     
     if (indexPath == null) {
@@ -674,7 +744,8 @@ public class KnnGraphTester implements FormatterLogger {
       KnnIndexer.IndexResult indexResult = new KnnIndexer(
         docVectorsPath,
         indexPath,
-        getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits),
+        getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits,
+                 ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfLloydIters, ivfCoarseTier, ivfFineTier, ivfKeepFullPrecision),
         numIndexThreads,
         vectorEncoding,
         dim,
@@ -977,7 +1048,10 @@ public class KnnGraphTester implements FormatterLogger {
                                        boolean rerank, int rerankQuantizeBits,
                                        boolean parentJoin, FilterStrategy filterStrategy,
                                        Float filterSelectivity, Long randomSeed,
-                                       Path docPath, int numDocs, String metric, boolean forceMerge)
+                                       Path docPath, int numDocs, String metric, boolean forceMerge,
+                                       int ivfNlist, int ivfSpillBits,
+                                       float ivfSpillMargin, float ivfSoarLambda, int ivfLloydIters,
+                                       String ivfCoarseTier, String ivfFineTier, boolean ivfKeepFullPrecision)
     throws IOException {
 
     List<String> suffix = new ArrayList<>();
@@ -1005,6 +1079,9 @@ public class KnnGraphTester implements FormatterLogger {
     
     if (indexType == IndexType.FLAT) {
       suffix.add("flat");
+    } else if (indexType == IndexType.IVFASTER) {
+      // ivfaster carries no HNSW hyperparams; its own write-time knobs are added below.
+      suffix.add("ivfaster");
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
       suffix.add(Integer.toString(maxConn));
@@ -1027,6 +1104,20 @@ public class KnnGraphTester implements FormatterLogger {
 
     if (parentJoin) {
       suffix.add("parentJoin");
+    }
+
+    // ivfaster: only write-time params affect the on-disk index (nprobe/bruteN/margins are search-time):
+    if (indexType == IndexType.IVFASTER) {
+      suffix.add("nl" + ivfNlist);
+      suffix.add("sb" + ivfSpillBits);
+      suffix.add("sm" + ivfSpillMargin);
+      suffix.add("sl" + ivfSoarLambda);
+      suffix.add("li" + ivfLloydIters);
+      suffix.add("ct" + ivfCoarseTier);
+      suffix.add("ft" + ivfFineTier);
+      if (ivfKeepFullPrecision) {
+        suffix.add("kfp");
+      }
     }
 
     if (forceMerge) {
@@ -1095,6 +1186,10 @@ public class KnnGraphTester implements FormatterLogger {
       log("flat has no graphs\n");
       return;
     }
+    if (indexType == IndexType.IVFASTER) {
+      log("ivfaster has no HNSW graph\n");
+      return;
+    }
     try (Directory dir = FSDirectory.open(indexPath);
          DirectoryReader reader = DirectoryReader.open(dir)) {
       for (LeafReaderContext context : reader.leaves()) {
@@ -1118,7 +1213,8 @@ public class KnnGraphTester implements FormatterLogger {
   @SuppressForbidden(reason = "Prints stuff")
   private double forceMerge() throws IOException, InterruptedException {
     IndexWriterConfig iwc = new IndexWriterConfig().setOpenMode(IndexWriterConfig.OpenMode.APPEND);
-    iwc.setCodec(getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits));
+    iwc.setCodec(getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits,
+                          ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfLloydIters, ivfCoarseTier, ivfFineTier, ivfKeepFullPrecision));
     KnnIndexer.TrackingConcurrentMergeScheduler tcms = new KnnIndexer.TrackingConcurrentMergeScheduler();
     iwc.setMergeScheduler(tcms);
     KnnIndexer.TrackingTieredMergePolicy ttmp = new KnnIndexer.TrackingTieredMergePolicy();
@@ -2209,34 +2305,57 @@ public class KnnGraphTester implements FormatterLogger {
 
   static Codec getCodec(int maxConn, int beamWidth, ExecutorService exec, int numMergeWorker,
                         boolean quantize, int quantizeBits, IndexType indexType,
-                        boolean rerank, int rerankQuantizeBits) {
+                        boolean rerank, int rerankQuantizeBits,
+                        int ivfNlist, int ivfNprobe, int ivfSpillBits,
+                        float ivfSoarLambda, int ivfLloydIters, String ivfCoarseTier, String ivfFineTier,
+                        boolean ivfKeepFullPrecision) {
       KnnVectorsFormat knnVectorsFormat;
-      if (quantize) {
+      if (indexType == IndexType.IVFASTER) {
+          IVFasterVectorsFormat.CoarseTier coarseTier = switch (ivfCoarseTier) {
+              case "nitrox2" -> IVFasterVectorsFormat.CoarseTier.NITROX2;
+              default -> throw new IllegalArgumentException(
+                  "-ivfCoarseTier must be 'nitrox2'; got: " + ivfCoarseTier);
+          };
+          IVFasterVectorsFormat.FineTier fineTier = switch (ivfFineTier) {
+              case "int8" -> IVFasterVectorsFormat.FineTier.INT8;
+              case "fp32", "float32", "none" -> null; // null => exact fp32 rerank
+              default -> throw new IllegalArgumentException(
+                  "-ivfFineTier must be 'int8' or 'fp32'; got: " + ivfFineTier);
+          };
+          knnVectorsFormat = new IVFasterVectorsFormat(
+              ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfLloydIters,
+              coarseTier, fineTier, ivfKeepFullPrecision);
+      } else if (quantize) {
           knnVectorsFormat = switch (quantizeBits) {
               case 1 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 2 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 4 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 7 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 8 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE, maxConn, beamWidth, numMergeWorker, exec);
+                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               default -> throw new IllegalArgumentException("Unsupported quantizeBits: " + quantizeBits);
           };

@@ -62,9 +62,11 @@ import static knn.KnnGraphTester.DOCTYPE_PARENT;
 
 public class KnnIndexer implements FormatterLogger {
 
-  // use smaller ram buffer so we get to merging sooner, making better use of
-  // many cores
-  private static final double WRITER_BUFFER_MB = 128;
+  // Larger buffer => fewer flush segments. This matters a lot for IVF codecs (ivfaster), which re-run
+  // Lloyd clustering on every flush AND every background merge: 128MB gave ~31 segments for 1M x 1024d
+  // (~4x the clustering work of the 512MB the lsh_ivf branch uses). HNSW/flat also benefit (fewer, larger
+  // segment graphs). Raised 128 -> 512 to match lsh_ivf's ivfaster indexing speed.
+  private static final double WRITER_BUFFER_MB = 1024;
 
   private final Path docsPath;
   private final Path indexPath;
@@ -142,6 +144,7 @@ public class KnnIndexer implements FormatterLogger {
         switch (vectorEncoding) {
           case BYTE -> KnnByteVectorField.createFieldType(dim, similarityFunction);
           case FLOAT32 -> KnnFloatVectorField.createFieldType(dim, similarityFunction);
+          default -> throw new IllegalArgumentException("unsupported vector encoding: " + vectorEncoding);
         };
     if (rerank && vectorEncoding != VectorEncoding.FLOAT32) {
       throw new IllegalArgumentException("rerank requires FLOAT32 vector encoding");

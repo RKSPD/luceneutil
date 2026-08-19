@@ -1812,6 +1812,10 @@ def getClassPath(checkout):
 
   cp.append(core_jar_file)  # noqa: FURB113
   cp.append("%s/lucene/sandbox/build/classes/java/main" % path)
+  # sandbox resources hold META-INF/services (the KnnVectorsFormat SPI file listing IVFasterVectorsFormat
+  # etc.); without this the classes-dir entry above has the .class files but SPI forName(...) at
+  # read/merge time can't discover them. The core JAR above already bundles its own services.
+  cp.append("%s/lucene/sandbox/build/resources/main" % path)
   cp.append("%s/lucene/misc/build/classes/java/main" % path)
   cp.append("%s/lucene/facet/build/classes/java/main" % path)
   cp.append("%s/lucene/analysis/common/build/classes/java/main" % path)

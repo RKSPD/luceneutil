@@ -1,0 +1,33 @@
+
+<!DOCTYPE html>
+<html>
+  <head>
+    <script type="text/javascript" src="https://www.google.com/jsapi"></script>
+    <script type="text/javascript">
+      google.load("visualization", "1", {packages:["corechart"]});
+      google.setOnLoadCallback(drawChart);
+      function drawChart() {
+        var data = google.visualization.arrayToDataTable([
+['', 'baseline'],
+[0.858, 0.551],
+        ]);
+
+        var options = {
+          //title: '$TITLE$',
+          pointSize: 5,
+          //legend: {position: 'none'},
+          hAxis: {title: 'Recall'},
+          vAxis: {title: 'CPU (msec)', direction: -1},
+          interpolateNulls: true
+        };
+
+        var chart = new google.visualization.LineChart(document.getElementById('chart_div'));
+        chart.draw(data, options);
+      }
+    </script>
+  </head>
+  <body>
+    <div id="chart_div" style="width: 1200px; height: 600px;"></div>
+  </body>
+</html>
+
