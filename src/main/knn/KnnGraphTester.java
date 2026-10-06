@@ -56,7 +56,8 @@ import org.apache.lucene.codecs.lucene104.Lucene104HnswScalarQuantizedVectorsFor
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader;
-import org.apache.lucene.sandbox.codecs.ivfaster.IVFasterVectorsFormat;
+import org.apache.lucene.sandbox.codecs.segmentivf.SegmentIVFVectorsFormat;
+import org.apache.lucene.sandbox.codecs.segmentivf.SegmentIVFKnnQuery;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
@@ -148,7 +149,12 @@ public class KnnGraphTester implements FormatterLogger {
     FLAT,
     // ivfaster: custom IVF float-vector codec (sandbox IVFasterVectorsFormat), selected via
     // -indexType ivfaster. Uses the -ivf* params; ignores the HNSW/quantize knobs.
-    IVFASTER
+    IVFASTER,
+    // ivfaster-evo: segment-lifecycle-aware IVF codec (sandbox IVFasterEvoVectorsFormat), selected
+    // via -indexType ivfaster-evo. Reuses the -ivfNlist/-ivfNprobe/-ivfSpillBits/-ivfSpillMargin
+    // params and -ivfFineTier (int8|fp32); nprobe is applied per-query via SearchStrategy, not a
+    // system property. Hot-start seeding uses the largest completed segment.
+    IVFASTER_EVO
   }
 
   enum SearchType {
@@ -169,6 +175,19 @@ public class KnnGraphTester implements FormatterLogger {
   public static final String KNN_FIELD_FILTERED = "knn-filtered";
   public static final String KNN_FIELD_RERANK = "knn-rerank";
   public static final String ID_FIELD = "id";
+  /** Static mirror of -ivfDaat, since the query builders below are static. */
+  private static boolean IVF_DAAT = false;
+  /** nprobe handed to IVFasterKnnQuery, so DAAT probes as widely as the acceptDocs run. */
+  private static int IVF_DAAT_NPROBE = 0;
+  /** -ivfDaatFixed: build IVFasterKnnQuery NON-adaptive, so leadCost does not size the
+   *  probe or the admission cut. Isolates the adaptive sizing as a variable. */
+  private static boolean IVF_DAAT_FIXED = false;
+  /** Static mirror of -indexType ivfaster-evo, since the query builders below are static. */
+  private static boolean IVF_EVO = false;
+  /** nprobe handed to the ivfaster-evo SearchStrategy at query time (per-query override). */
+  private static int IVF_EVO_NPROBE = 0;
+  /** Probe margin handed to the ivfaster-evo SearchStrategy at query time. */
+  private static float IVF_EVO_NPROBE_MARGIN = 0.75f;
   private static final String INDEX_DIR = "knnIndices";
   public static final String DOCTYPE_FIELD = "docType";
   public static final String DOCTYPE_PARENT = "_parent";
@@ -189,6 +208,7 @@ public class KnnGraphTester implements FormatterLogger {
   private boolean quiet;
   private boolean reindex;
   private boolean forceMerge;
+  private boolean halfFloatDocs;
   private int reindexTimeMsec;
   private int mergeTimeMsec;
   private double forceMergeTimeSec;
@@ -211,6 +231,28 @@ public class KnnGraphTester implements FormatterLogger {
   private Query filterQuery;
   private FilterStrategy filterStrategy;
   private Float filterSelectivity;
+  // Route a query-time pre-filter through IVFasterKnnQuery as a BooleanQuery clause
+  // (doc-at-a-time leapfrog) instead of handing it to the codec as acceptDocs.
+  private boolean ivfDaat;
+  private boolean ivfDaatFixed;
+  /**
+   * -filterClauses m: express the SAME accept set as a conjunction of m clauses instead of one,
+   * each of selectivity s^(1/m). The accepted set -- and therefore the ground truth -- is
+   * bit-identical; only what Lucene can infer about the filter from clause {@code cost()} changes.
+   * This is what probes whether a rarity estimate read off {@code leadCost} survives conjunctive
+   * filters, since a conjunction's cost is the MIN of its clauses, not their product.
+   */
+  private int filterClauses = 1;
+
+  /**
+   * -filterAnti: build the clauses ANTI-CORRELATED instead of independent, at the same cumulative
+   * selectivity. Each clause is the accept set plus its own private slice of the rejected documents,
+   * the slices being disjoint, so the intersection is still exactly the accept set while every clause
+   * is far denser than {@code s^(1/m)}. Independence then predicts a much larger intersection than the
+   * truth, which is the case a product-of-marginals estimate gets WRONG and a measured conditional
+   * chain gets right. This is the discriminating test between the two estimators.
+   */
+  private boolean filterAnti;
   private boolean randomCommits;
   private boolean parentJoin;
   private Path parentJoinMetaFile;
@@ -224,16 +266,16 @@ public class KnnGraphTester implements FormatterLogger {
   // ivfaster: custom IVF float-vector codec (org.apache.lucene.sandbox.codecs.ivfaster.IVFasterVectorsFormat),
   // selected via -indexType ivfaster (see IndexType.IVFASTER). These params are read only on that path.
   // --- write-time (baked into the index; part of the index cache key) ---
-  private int ivfNlist = IVFasterVectorsFormat.DEFAULT_NLIST;            // Lloyd clusters / posting lists
-  private int ivfSpillBits = IVFasterVectorsFormat.DEFAULT_SPILL_BITS;   // SOAR spill: extra cells each doc is written into
+  private int ivfNlist = 1000;                                           // Lloyd clusters / posting lists
+  private int ivfSpillBits = 1;                                          // SOAR spill: extra cells each doc is written into
   private float ivfSpillMargin = 1.10f;                                  // boundary margin for spill/Reaper (ivfaster.spillMargin)
-  private float ivfSoarLambda = IVFasterVectorsFormat.DEFAULT_SOAR_LAMBDA; // SOAR spill-selection weight
-  private int ivfLloydIters = IVFasterVectorsFormat.DEFAULT_LLOYD_ITERS; // Lloyd iterations over the corpus
+  private float ivfSoarLambda = 1.0f;                                    // SOAR spill-selection weight
+  private int ivfLloydIters = 10;                                        // Lloyd iterations over the corpus
   private String ivfCoarseTier = "nitrox2";                              // coarse tier: nitrox2
   private String ivfFineTier = "int8";                                   // fine/rerank tier: int8 | fp32
   private boolean ivfKeepFullPrecision;                                  // also store raw fp32 vectors (int8/udot6 only)
   // --- search-time (NOT part of the index key; sweepable against a cached index via -Divfaster.* props) ---
-  private int ivfNprobe = IVFasterVectorsFormat.DEFAULT_NPROBE;          // cells scanned per query
+  private int ivfNprobe = 32;                                            // cells scanned per query
   // oversampling, e.g. the multiple * k to gather before checking recall
   private float overSample;
   // whether to use two-phase reranking: HNSW retrieves overSample*topK candidates, then
@@ -264,6 +306,8 @@ public class KnnGraphTester implements FormatterLogger {
     vectorEncoding = VectorEncoding.FLOAT32;
     filterStrategy = null;
     filterSelectivity = null;
+    ivfDaat = false;
+    ivfDaatFixed = false;
     quantize = false;
     randomCommits = false;
     quantizeBits = 7;
@@ -354,8 +398,11 @@ public class KnnGraphTester implements FormatterLogger {
             case "ivfaster":
               indexType = IndexType.IVFASTER;
               break;
+            case "ivfaster-evo":
+              indexType = IndexType.IVFASTER_EVO;
+              break;
             default:
-              throw new IllegalArgumentException("-indexType can be 'hnsw', 'flat' or 'ivfaster' only");
+              throw new IllegalArgumentException("-indexType can be 'hnsw', 'flat', 'ivfaster' or 'ivfaster-evo' only");
           }
           break;
         case "-overSample":
@@ -500,6 +547,9 @@ public class KnnGraphTester implements FormatterLogger {
         case "-forceMerge":
           forceMerge = true;
           break;
+        case "-halfFloatDocs":
+          halfFloatDocs = true;
+          break;
         case "-randomCommits":
           randomCommits = true;
           break;
@@ -515,6 +565,25 @@ public class KnnGraphTester implements FormatterLogger {
             case "index-time-sparse" -> FilterStrategy.INDEX_TIME_SPARSE;
             default -> throw new IllegalArgumentException("-filterStrategy must be one of (case-insensitive) {'query-time-pre-filter', 'query-time-post-filter', 'index-time-filter'}, found: " + filterStrategyVal);
           };
+          break;
+        case "-ivfDaat":
+          ivfDaat = true;
+          break;
+        case "-ivfDaatFixed":
+          ivfDaat = true;
+          ivfDaatFixed = true;
+          break;
+        case "-filterAnti":
+          filterAnti = true;
+          break;
+        case "-filterClauses":
+          if (iarg == args.length - 1) {
+            throw new IllegalArgumentException("-filterClauses requires a following int");
+          }
+          filterClauses = Integer.parseInt(args[++iarg]);
+          if (filterClauses < 1) {
+            throw new IllegalArgumentException("-filterClauses must be >= 1");
+          }
           break;
         case "-filterSelectivity":
           if (iarg == args.length - 1) {
@@ -609,6 +678,7 @@ public class KnnGraphTester implements FormatterLogger {
           // arg parsing, before any ivfaster writer class loads (indexing happens later).
           ivfSpillMargin = Float.parseFloat(args[++iarg]);
           System.setProperty("ivfaster.spillMargin", Float.toString(ivfSpillMargin));
+          System.setProperty("segmentivf.spillMargin", Float.toString(ivfSpillMargin));
           break;
         case "-ivfSoarLambda":
           ivfSoarLambda = Float.parseFloat(args[++iarg]);
@@ -636,7 +706,9 @@ public class KnnGraphTester implements FormatterLogger {
           System.setProperty("ivfaster.bruteN", args[++iarg]);
           break;
         case "-ivfNprobeMargin":
-          System.setProperty("ivfaster.nprobeMargin", args[++iarg]);
+          String nprobeMargin = args[++iarg];
+          System.setProperty("ivfaster.nprobeMargin", nprobeMargin);
+          IVF_EVO_NPROBE_MARGIN = Float.parseFloat(nprobeMargin);
           break;
         case "-ivfVerifyMultiplier":
           System.setProperty("ivfaster.verifyMultiplier", args[++iarg]);
@@ -666,6 +738,11 @@ public class KnnGraphTester implements FormatterLogger {
     }
     log("Seed = %d\n", randomSeed);
     random = new Random(randomSeed);
+    IVF_DAAT = ivfDaat;
+    IVF_DAAT_NPROBE = ivfNprobe;
+    IVF_DAAT_FIXED = ivfDaatFixed;
+    IVF_EVO = indexType == IndexType.IVFASTER_EVO;
+    IVF_EVO_NPROBE = ivfNprobe;
 
     if (filterSelectivity != null) {
       filtered = selectRandomDocs(random, numDocs, filterSelectivity);
@@ -745,7 +822,7 @@ public class KnnGraphTester implements FormatterLogger {
         docVectorsPath,
         indexPath,
         getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits,
-                 ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfLloydIters, ivfCoarseTier, ivfFineTier, ivfKeepFullPrecision),
+                 ivfNlist, ivfNprobe, ivfSpillBits, ivfSpillMargin, ivfSoarLambda, ivfLloydIters, ivfCoarseTier, ivfFineTier, ivfKeepFullPrecision),
         numIndexThreads,
         vectorEncoding,
         dim,
@@ -757,7 +834,8 @@ public class KnnGraphTester implements FormatterLogger {
         parentJoinMetaFile,
         useBp,
         indexTimeFilter,
-        rerank
+        rerank,
+        halfFloatDocs
       ).createIndex();
       reindexTimeMsec = indexResult.indexTimeMsec();
       mergeTimeMsec = indexResult.mergeTimeMsec();
@@ -838,10 +916,12 @@ public class KnnGraphTester implements FormatterLogger {
         Files.writeString(forceMergeTimePath(indexPath), String.valueOf(forceMergeTimeSec));
       }
     }
-    if (filterStrategy == FilterStrategy.INDEX_TIME_SPARSE) {
-      printIndexStatistics(indexPath, KNN_FIELD_FILTERED);
-    } else {
-      printIndexStatistics(indexPath, KNN_FIELD);
+    if (Boolean.getBoolean("knn.skipIndexStatistics") == false) {
+      if (filterStrategy == FilterStrategy.INDEX_TIME_SPARSE) {
+        printIndexStatistics(indexPath, KNN_FIELD_FILTERED);
+      } else {
+        printIndexStatistics(indexPath, KNN_FIELD);
+      }
     }
     if (operation != null) {
       switch (operation) {
@@ -851,7 +931,10 @@ public class KnnGraphTester implements FormatterLogger {
             throw new IllegalArgumentException("missing -docs arg");
           }
           if (filterSelectivity != null) {
-            filterQuery = createFilterQuery(indexPath, filtered);
+            filterQuery = filterClauses == 1
+                ? createFilterQuery(indexPath, filtered)
+                : createConjunctiveFilterQuery(indexPath, filtered, numDocs, filterClauses,
+                                               filterSelectivity, randomSeed == null ? 42L : randomSeed);
           }
           if (outputPath != null) {
             testSearch(indexPath, queryPath, queryStartIndex, outputPath, null, metric);
@@ -1041,6 +1124,99 @@ public class KnnGraphTester implements FormatterLogger {
     }
   }
 
+  /**
+   * Expresses {@code accepted} as a conjunction of {@code clauses} clauses, each of selectivity
+   * {@code s^(1/clauses)}, whose intersection is EXACTLY {@code accepted}.
+   *
+   * <p>Why the intersection must be exact: the ground truth is the brute-force top-k of the accepted
+   * set. If the conjunction admitted even one document outside {@code accepted}, or dropped one
+   * inside it, recall would be measured against the wrong answer key and the comparison against the
+   * single-clause run would be meaningless. So this is not "a filter of the same selectivity" -- it
+   * is the same accept set, rewritten.
+   *
+   * <p>Construction. Every clause is a superset of {@code accepted}. Each REJECTED document is first
+   * assigned one clause to be excluded from, which is what guarantees the intersection admits no
+   * extra document; it then joins each of the remaining clauses independently with probability p.
+   * Solving |C_j|/N = s + (1-s)(1-1/m)p = s^(1/m) for p gives
+   *
+   * <pre>  p = (s^(1/m) - s) / ((1-s)(1-1/m))</pre>
+   *
+   * which lies in (0,1) for every m >= 2 and s in (0,1), so no clamping is needed.
+   *
+   * <p>Clause cost is therefore N*s^(1/m) rather than N*s -- for s=0.1, m=3 that is 46% of the corpus
+   * per clause against a 10% conjunction. A conjunction's {@code cost()} is the min over clauses, so
+   * this is exactly the case where reading rarity off {@code leadCost} underestimates it.
+   */
+  private Query createConjunctiveFilterQuery(Path indexPath, Bits accepted, int numDocs,
+                                             int clauses, float selectivity, long seed)
+      throws IOException {
+    double s = selectivity;
+    // Independent construction: each rejected doc is excluded from exactly one clause and joins the
+    // rest with probability p, giving per-clause selectivity s^(1/m).
+    // Anti-correlated construction: each rejected doc joins exactly ONE clause, so the clauses are
+    // near-complementary over the rejected set. Intersection is still exactly the accept set, but each
+    // clause is much denser, so a product of marginals badly over-states the intersection.
+    double p = (Math.pow(s, 1.0 / clauses) - s) / ((1 - s) * (1 - 1.0 / clauses));
+    Random rnd = new Random(seed * 1000003L + clauses + (filterAnti ? 7777L : 0L));
+    FixedBitSet[] global = new FixedBitSet[clauses];
+    for (int j = 0; j < clauses; j++) {
+      global[j] = new FixedBitSet(numDocs);
+    }
+    int[] card = new int[clauses];
+    for (int d = 0; d < numDocs; d++) {
+      if (accepted.get(d)) {
+        for (int j = 0; j < clauses; j++) {
+          global[j].set(d);
+          card[j]++;
+        }
+      } else if (filterAnti) {
+        int only = rnd.nextInt(clauses);
+        global[only].set(d);
+        card[only]++;
+      } else {
+        int excluded = rnd.nextInt(clauses);
+        for (int j = 0; j < clauses; j++) {
+          if (j != excluded && rnd.nextDouble() < p) {
+            global[j].set(d);
+            card[j]++;
+          }
+        }
+      }
+    }
+    for (int j = 0; j < clauses; j++) {
+      log("filter clause %d/%d: %d docs (%.4f of corpus)\n", j + 1, clauses, card[j], card[j] / (double) numDocs);
+    }
+
+    // Map global doc ids to per-segment ids once for all clauses; createFilterQuery would rescan
+    // stored fields per clause.
+    BooleanQuery.Builder bq = new BooleanQuery.Builder();
+    try (Directory dir = FSDirectory.open(indexPath);
+         DirectoryReader reader = DirectoryReader.open(dir)) {
+      BitSet[][] perClause = new BitSet[clauses][reader.leaves().size()];
+      for (int j = 0; j < clauses; j++) {
+        for (var leafContext : reader.leaves()) {
+          perClause[j][leafContext.ord] = new FixedBitSet(reader.maxDoc());
+        }
+      }
+      for (var leafContext : reader.leaves()) {
+        var storedFields = leafContext.reader().storedFields();
+        for (int d = 0; d < leafContext.reader().maxDoc(); d++) {
+          int docID = Integer.parseInt(
+              storedFields.document(d, Set.of(KnnGraphTester.ID_FIELD)).get(KnnGraphTester.ID_FIELD));
+          for (int j = 0; j < clauses; j++) {
+            if (global[j].get(docID)) {
+              ((FixedBitSet) perClause[j][leafContext.ord]).set(d);
+            }
+          }
+        }
+      }
+      for (int j = 0; j < clauses; j++) {
+        bq.add(new BitSetQuery(perClause[j]), BooleanClause.Occur.FILTER);
+      }
+    }
+    return bq.build();
+  }
+
   // static so we are forced to pass in all things that are volatile wrt indexing (if they change, it requires reindexing)
   private static String formatIndexKey(IndexType indexType, int maxConn, int beamWidth,
                                        boolean useBp,
@@ -1082,6 +1258,9 @@ public class KnnGraphTester implements FormatterLogger {
     } else if (indexType == IndexType.IVFASTER) {
       // ivfaster carries no HNSW hyperparams; its own write-time knobs are added below.
       suffix.add("ivfaster");
+    } else if (indexType == IndexType.IVFASTER_EVO) {
+      // ivfaster-evo carries no HNSW hyperparams; its own write-time knobs are added below.
+      suffix.add("ivfasterevo");
     } else {
       // if HNSW hyperparams change, or bg (vector reordering) is enabled, reindex:
       suffix.add(Integer.toString(maxConn));
@@ -1117,6 +1296,17 @@ public class KnnGraphTester implements FormatterLogger {
       suffix.add("ft" + ivfFineTier);
       if (ivfKeepFullPrecision) {
         suffix.add("kfp");
+      }
+    }
+
+    // ivfaster-evo write-time knobs (numProbes is search-time, applied per-query via SearchStrategy):
+    if (indexType == IndexType.IVFASTER_EVO) {
+      suffix.add("nl" + ivfNlist);
+      suffix.add("sb" + ivfSpillBits);
+      suffix.add("sm" + ivfSpillMargin);
+      suffix.add("ft" + ivfFineTier);
+      if (ivfCoarseTier.equals("nitrox2") == false) {
+        suffix.add("ct" + ivfCoarseTier); // Nitrox2 keys predate the option
       }
     }
 
@@ -1186,7 +1376,7 @@ public class KnnGraphTester implements FormatterLogger {
       log("flat has no graphs\n");
       return;
     }
-    if (indexType == IndexType.IVFASTER) {
+    if (indexType == IndexType.IVFASTER || indexType == IndexType.IVFASTER_EVO) {
       log("ivfaster has no HNSW graph\n");
       return;
     }
@@ -1214,7 +1404,7 @@ public class KnnGraphTester implements FormatterLogger {
   private double forceMerge() throws IOException, InterruptedException {
     IndexWriterConfig iwc = new IndexWriterConfig().setOpenMode(IndexWriterConfig.OpenMode.APPEND);
     iwc.setCodec(getCodec(maxConn, beamWidth, exec, numMergeWorker, quantize, quantizeBits, indexType, rerank, rerankQuantizeBits,
-                          ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfLloydIters, ivfCoarseTier, ivfFineTier, ivfKeepFullPrecision));
+                          ivfNlist, ivfNprobe, ivfSpillBits, ivfSpillMargin, ivfSoarLambda, ivfLloydIters, ivfCoarseTier, ivfFineTier, ivfKeepFullPrecision));
     KnnIndexer.TrackingConcurrentMergeScheduler tcms = new KnnIndexer.TrackingConcurrentMergeScheduler();
     iwc.setMergeScheduler(tcms);
     KnnIndexer.TrackingTieredMergePolicy ttmp = new KnnIndexer.TrackingTieredMergePolicy();
@@ -1633,15 +1823,52 @@ public class KnnGraphTester implements FormatterLogger {
     if (isParentJoinQuery) {
       var topChildVectors = switch (searchType) {
         case KNN -> new DiversifyingChildrenFloatKnnVectorQuery(knnField, vector, null, k + fanout, parentsFilter);
-        case RADIUS -> new FloatVectorSimilarityQuery(knnField, vector, resultSimilarity, decay, filter);
+        case RADIUS -> new FloatVectorSimilarityQuery.Adaptive(knnField, vector, resultSimilarity, decay, filter);
       };
       var query = new ToParentBlockJoinQuery(topChildVectors, parentsFilter, org.apache.lucene.search.join.ScoreMode.Max);
       TopDocs topDocs = searcher.search(query, resultSize);
       return new Result(topDocs, 0, 0);
     }
 
+    // -ivfDaat: evaluate the kNN clause DOC-AT-A-TIME against the filter instead of pushing the
+    // filter into the codec as acceptDocs. IVFasterKnnQuery's scorer exposes the probed cells as a
+    // disjunction, so Lucene's conjunction leapfrogs between the sparser clause and the cells. Same
+    // filter Query, same ground truth, same recall computation as the acceptDocs path -- only the
+    // query shape differs, which is what makes the two comparable.
+    if (IVF_DAAT && searchType == SearchType.KNN && filterStrategy == FilterStrategy.QUERY_TIME_PRE_FILTER) {
+      // The filter is handed over a SECOND time, for sizing only. A clause cannot see its siblings,
+      // so without this the probe is sized from leadCost -- the MINIMUM clause cost -- which
+      // under-states rarity on any conjunction. Same Query object, so matching is unchanged.
+      Query knn =
+          new SegmentIVFKnnQuery(
+              knnField,
+              vector,
+              k + fanout,
+              IVF_DAAT_FIXED ? null : filter,
+              new SegmentIVFVectorsFormat.SearchStrategy(
+                  IVF_DAAT_NPROBE, IVF_EVO_NPROBE_MARGIN));
+      Query daat = new BooleanQuery.Builder()
+        .add(knn, BooleanClause.Occur.MUST)
+        .add(filter, BooleanClause.Occur.FILTER)
+        .build();
+      TopDocs daatDocs = searcher.search(daat, resultSize);
+      return new Result(daatDocs, 0, 0);
+    }
+
     ProfiledVectorQuery vectorQuery = switch (searchType) {
-      case KNN -> new ProfiledKnnFloatVectorQuery(knnField, vector, k, fanout, queryTimeFilter);
+      // ivfaster-evo reads nprobe per-query from its SearchStrategy (not a system property), so the
+      // query carries it. Profiling (totalVisitedVectorCount) is unchanged.
+      // ivfaster-evo uses its own query (one global fine rerank across segments);
+      // -Dknn.evoSegmentRerank=true keeps the plain per-segment query for A/B.
+      case KNN -> IVF_EVO && EVO_SEGMENT_RERANK == false
+          ? new ProfiledEvoQuery(new org.apache.lucene.sandbox.codecs.segmentivf.SegmentIVFKnnQuery(
+              knnField, vector, k + fanout, queryTimeFilter,
+              new SegmentIVFVectorsFormat.SearchStrategy(IVF_EVO_NPROBE, IVF_EVO_NPROBE_MARGIN)))
+          : IVF_EVO
+          ? new ProfiledKnnFloatVectorQuery(knnField, vector, k, fanout, queryTimeFilter,
+              new SegmentIVFVectorsFormat.SearchStrategy(
+                  IVF_EVO_NPROBE, IVF_EVO_NPROBE_MARGIN))
+          : new ProfiledKnnFloatVectorQuery(knnField, vector, k, fanout, queryTimeFilter);
       case RADIUS -> new ProfiledFloatVectorSimilarityQuery(knnField, vector, resultSimilarity, decay, filter);
     };
     Query query;
@@ -2306,56 +2533,61 @@ public class KnnGraphTester implements FormatterLogger {
   static Codec getCodec(int maxConn, int beamWidth, ExecutorService exec, int numMergeWorker,
                         boolean quantize, int quantizeBits, IndexType indexType,
                         boolean rerank, int rerankQuantizeBits,
-                        int ivfNlist, int ivfNprobe, int ivfSpillBits,
+                        int ivfNlist, int ivfNprobe, int ivfSpillBits, float ivfSpillMargin,
                         float ivfSoarLambda, int ivfLloydIters, String ivfCoarseTier, String ivfFineTier,
                         boolean ivfKeepFullPrecision) {
       KnnVectorsFormat knnVectorsFormat;
-      if (indexType == IndexType.IVFASTER) {
-          IVFasterVectorsFormat.CoarseTier coarseTier = switch (ivfCoarseTier) {
-              case "nitrox2" -> IVFasterVectorsFormat.CoarseTier.NITROX2;
+      if (indexType == IndexType.IVFASTER_EVO) {
+          // ivfaster-evo: numProbes is the segment default (also overridden per-query via
+          // SearchStrategy). Fine tier is int8 or fp32; coarse tier nitrox2 or bbq.
+          SegmentIVFVectorsFormat.FineTier evoFineTier = switch (ivfFineTier) {
+              case "int8" -> SegmentIVFVectorsFormat.FineTier.INT8;
+              case "fp32", "float32" -> SegmentIVFVectorsFormat.FineTier.FP32;
               default -> throw new IllegalArgumentException(
-                  "-ivfCoarseTier must be 'nitrox2'; got: " + ivfCoarseTier);
+                  "-ivfFineTier must be 'int8' or 'fp32' for ivfaster-evo; got: " + ivfFineTier);
           };
-          IVFasterVectorsFormat.FineTier fineTier = switch (ivfFineTier) {
-              case "int8" -> IVFasterVectorsFormat.FineTier.INT8;
-              case "fp32", "float32", "none" -> null; // null => exact fp32 rerank
+          SegmentIVFVectorsFormat.CoarseTier evoCoarseTier = switch (ivfCoarseTier) {
+              case "nitrox2" -> SegmentIVFVectorsFormat.CoarseTier.NITROX2;
+              case "bbq" -> SegmentIVFVectorsFormat.CoarseTier.BBQ;
               default -> throw new IllegalArgumentException(
-                  "-ivfFineTier must be 'int8' or 'fp32'; got: " + ivfFineTier);
+                  "-ivfCoarseTier must be 'nitrox2' or 'bbq' for ivfaster-evo; got: " + ivfCoarseTier);
           };
-          knnVectorsFormat = new IVFasterVectorsFormat(
-              ivfNlist, ivfNprobe, ivfSpillBits, ivfSoarLambda, ivfLloydIters,
-              coarseTier, fineTier, ivfKeepFullPrecision);
+          knnVectorsFormat = new SegmentIVFVectorsFormat(
+              ivfNlist, ivfNprobe, ivfSpillBits, evoFineTier, evoCoarseTier);
+      } else if (indexType == IndexType.IVFASTER) {
+          throw new IllegalArgumentException(
+              "the predecessor ivfaster codec is unavailable in this Lucene checkout; use ivfaster-evo for SegmentIVF");
       } else if (quantize) {
           knnVectorsFormat = switch (quantizeBits) {
               case 1 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SINGLE_BIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
+                  case IVFASTER, IVFASTER_EVO -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 2 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.DIBIT_QUERY_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
+                  case IVFASTER, IVFASTER_EVO -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 4 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.PACKED_NIBBLE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
+                  case IVFASTER, IVFASTER_EVO -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 7 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.SEVEN_BIT, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
+                  case IVFASTER, IVFASTER_EVO -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               case 8 -> switch (indexType) {
                   case FLAT -> new Lucene104ScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE);
                   case HNSW ->
                           new Lucene104HnswScalarQuantizedVectorsFormat(ScalarEncoding.UNSIGNED_BYTE, maxConn, beamWidth, numMergeWorker, exec);
-                  case IVFASTER -> throw new AssertionError("ivfaster is handled before the quantize branch");
+                  case IVFASTER, IVFASTER_EVO -> throw new AssertionError("ivfaster is handled before the quantize branch");
               };
               default -> throw new IllegalArgumentException("Unsupported quantizeBits: " + quantizeBits);
           };
@@ -2398,6 +2630,47 @@ public class KnnGraphTester implements FormatterLogger {
 
   interface ProfiledVectorQuery {
     long totalVisitedVectorCount();
+  }
+
+  private static final boolean EVO_SEGMENT_RERANK = Boolean.getBoolean("knn.evoSegmentRerank");
+
+  /** Wraps the (final) IVFasterEvoKnnQuery; visited counts are not reported for it. */
+  private static final class ProfiledEvoQuery extends Query implements ProfiledVectorQuery {
+    private final Query query;
+
+    ProfiledEvoQuery(Query query) {
+      this.query = query;
+    }
+
+    @Override
+    public Query rewrite(IndexSearcher searcher) throws IOException {
+      return query.rewrite(searcher);
+    }
+
+    @Override
+    public long totalVisitedVectorCount() {
+      return 0;
+    }
+
+    @Override
+    public String toString(String field) {
+      return query.toString(field);
+    }
+
+    @Override
+    public void visit(org.apache.lucene.search.QueryVisitor visitor) {
+      query.visit(visitor);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      return other instanceof ProfiledEvoQuery p && query.equals(p.query);
+    }
+
+    @Override
+    public int hashCode() {
+      return query.hashCode();
+    }
   }
 
   private static class ProfiledKnnByteVectorQuery extends KnnByteVectorQuery implements ProfiledVectorQuery {
@@ -2453,6 +2726,17 @@ public class KnnGraphTester implements FormatterLogger {
       this.filter = filter;
     }
 
+    // Variant carrying a per-query KnnSearchStrategy (e.g. ivfaster-evo's nprobe override).
+    ProfiledKnnFloatVectorQuery(String field, float[] target, int k, int fanout, Query filter,
+        org.apache.lucene.search.knn.KnnSearchStrategy searchStrategy) {
+      super(field, target, k + fanout, filter, searchStrategy);
+      this.field = field;
+      this.target = target;
+      this.k = k;
+      this.fanout = fanout;
+      this.filter = filter;
+    }
+
     @Override
     public Query rewrite(IndexSearcher indexSearcher) throws IOException {
       totalVisitedVectorCount = 0;
@@ -2474,7 +2758,7 @@ public class KnnGraphTester implements FormatterLogger {
   }
 
   // TODO: also profile exact search
-  private static class ProfiledByteVectorSimilarityQuery extends ByteVectorSimilarityQuery implements  ProfiledVectorQuery {
+  private static class ProfiledByteVectorSimilarityQuery extends ByteVectorSimilarityQuery.Adaptive implements  ProfiledVectorQuery {
     private final LongAdder totalVisitedVectorCount;
 
     public ProfiledByteVectorSimilarityQuery(String field, byte[] target, float resultSimilarity, float decay, Query filter) {
@@ -2504,7 +2788,7 @@ public class KnnGraphTester implements FormatterLogger {
   }
 
   // TODO: also profile exact search
-  private static class ProfiledFloatVectorSimilarityQuery extends FloatVectorSimilarityQuery implements  ProfiledVectorQuery {
+  private static class ProfiledFloatVectorSimilarityQuery extends FloatVectorSimilarityQuery.Adaptive implements  ProfiledVectorQuery {
     private final LongAdder totalVisitedVectorCount;
 
     public ProfiledFloatVectorSimilarityQuery(String field, float[] target, float resultSimilarity, float decay, Query filter) {

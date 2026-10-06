@@ -160,7 +160,7 @@ NOISY = True
 # indexType to "ivfaster" (and typically ndoc=1_000_000, numSearchThread=0 for the frontier).
 PARAMS = {
   "ndoc": (1_000_000,),
-  "indexType": ("ivfaster",),            # hnsw | flat | ivfaster
+  "indexType": ("ivfaster-evo",),            # hnsw | flat | ivfaster | ivfaster-evo
   "maxConn": (64,),
   "beamWidthIndex": (250,),
   "fanout": (100,),
@@ -181,21 +181,18 @@ PARAMS = {
   "nquery": (1000,),
   "rerank": (False,),               # HNSW sweep: (True, False). False avoids the 1M x 1024d rerank HNSW graph.
   "rerankQuantizeBits": (32,),      # HNSW sweep: (32, 8, 4)
-  # ---- ivfaster: read only when indexType == "ivfaster"; inert (ignored by getCodec) otherwise ----
-  # Seeded near the Graviton3 recall@100 frontier. The 0.951@~0.68ms headline used the full research
-  # codec (1-bit coarse + matched filter + native udot + udot6); this release branch ships 2-bit
-  # Nitrox2 coarse + the int8 fine tier, so its int8 frontier is nearer 0.952 @ ~0.72-0.74 ms.
-  # write-time knobs (each distinct value reindexes):
-  "ivfNlist": (8000,),
-  "ivfSpillBits": (3,),              # sp3: coverage from fewer probed cells -> lower nprobe
-  "ivfSpillMargin": (1.40,),         # tighten to 1.40 at sp3 (default 1.10 overspills)
-  "ivfSoarLambda": (1.0,),
-  "ivfLloydIters": (10,),
+
+  # ivfaster-evo run: nlist=1000, spill=1, INT8 fine tier.
+  "ivfNlist": (1000,),
+  "ivfSpillBits": (1,),
+  "ivfSpillMargin": (1.05,),
+  "ivfSoarLambda": (1.0,),           # ignored by ivfaster-evo
+  "ivfLloydIters": (10,),            # ignored by ivfaster-evo
   "ivfCoarseTier": ("nitrox2",),     # nitrox2
-  "ivfFineTier": ("int8",),          # int8 | fp32
-  # "ivfKeepFullPrecision": (True,),  # also store raw fp32 (int8 tier only)
+  "ivfFineTier": ("int8",),          # ivfaster-evo: int8 | fp32
+  # "ivfKeepFullPrecision": (True,),  # ignored by ivfaster-evo
   # search-time knobs (no reindex -- swept against one cached index; sweep the frontier here):
-  "ivfNprobe": (8, 16, 24, 32, 64, 96),               # wide sweep to regenerate e2e recall bands
+  "ivfNprobe": (8, 16, 32, 45, 64),
   "ivfBruteN": (700,),               # bruteN saturates ~800
   "ivfNprobeMargin": (0.75,),        # probe wide (np45), prune on quality (m0.75)
   "ivfVerifyMultiplier": (2,),

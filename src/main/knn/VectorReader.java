@@ -41,6 +41,15 @@ public abstract class VectorReader {
     };
   }
 
+  /**
+   * A reader for a flat fp16 (half-float) file: {@code dim * 2} bytes per vector, each widened to a
+   * float. The Lucene-facing encoding is still FLOAT32 -- this only changes the on-disk stride, to
+   * halve the docs file. See {@link VectorReaderHalfFloat}.
+   */
+  static VectorReader createHalfFloat(FileChannel input, int dim, int vectorStartIndex) throws IOException {
+    return new VectorReaderHalfFloat(input, dim, dim * Short.BYTES, vectorStartIndex);
+  }
+
   VectorReader(FileChannel input, int dim, int bufferSize, int vectorStartIndex) throws IOException {
     this.bytes = ByteBuffer.wrap(new byte[bufferSize]).order(ByteOrder.LITTLE_ENDIAN);
     this.input = input;

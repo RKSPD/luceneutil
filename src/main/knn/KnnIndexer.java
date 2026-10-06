@@ -55,6 +55,7 @@ import org.apache.lucene.misc.index.BPReorderingMergePolicy;
 import org.apache.lucene.misc.index.BpVectorReorderer;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.InfoStream;
 import org.apache.lucene.util.PrintStreamInfoStream;
 
 import static knn.KnnGraphTester.DOCTYPE_CHILD;
@@ -66,7 +67,9 @@ public class KnnIndexer implements FormatterLogger {
   // Lloyd clustering on every flush AND every background merge: 128MB gave ~31 segments for 1M x 1024d
   // (~4x the clustering work of the 512MB the lsh_ivf branch uses). HNSW/flat also benefit (fewer, larger
   // segment graphs). Raised 128 -> 512 to match lsh_ivf's ivfaster indexing speed.
-  private static final double WRITER_BUFFER_MB = 1024;
+  // Overridable via -Dknn.writerBufferMB. Bigger buffer => larger initial flush segments => fewer
+  // merge tiers => less IVF re-clustering amplification on the way up to large merged segments.
+  private static final double WRITER_BUFFER_MB = Double.parseDouble(System.getProperty("knn.writerBufferMB", "1024"));
 
   private final Path docsPath;
   private final Path indexPath;
@@ -85,12 +88,15 @@ public class KnnIndexer implements FormatterLogger {
   private final TrackingConcurrentMergeScheduler tcms;
   private final TrackingTieredMergePolicy ttmp;
   private final boolean rerank;
+  // When true the docs file is read as flat fp16 (dim*2 bytes/vec) and widened to float; the field
+  // is still FLOAT32. Only affects the docs read, not queries. Halves the on-disk docs file.
+  private final boolean halfFloatDocs;
 
   public KnnIndexer(Path docsPath, Path indexPath, Codec codec, int numIndexThreads,
                     VectorEncoding vectorEncoding, int dim,
                     VectorSimilarityFunction similarityFunction, int numDocs, int docsStartIndex, boolean quiet,
                     boolean parentJoin, Path parentJoinMetaPath, boolean useBp, FilterScheme filterScheme,
-                    boolean rerank) {
+                    boolean rerank, boolean halfFloatDocs) {
     this.docsPath = docsPath;
     this.indexPath = indexPath;
     this.codec = codec;
@@ -106,6 +112,10 @@ public class KnnIndexer implements FormatterLogger {
     this.useBp = useBp;
     this.filterScheme = filterScheme;
     this.rerank = rerank;
+    this.halfFloatDocs = halfFloatDocs;
+    if (halfFloatDocs && vectorEncoding != VectorEncoding.FLOAT32) {
+      throw new IllegalArgumentException("halfFloatDocs requires FLOAT32 vector encoding (fp16 widens to float)");
+    }
     this.tcms = new TrackingConcurrentMergeScheduler();
     this.ttmp = new TrackingTieredMergePolicy();
   }
@@ -131,6 +141,15 @@ public class KnnIndexer implements FormatterLogger {
     
     iwc.setMergePolicy(ttmp);
     ttmp.setFloorSegmentMB(256);
+    // TieredMergePolicy caps merged segments at maxMergedSegmentMB (Lucene default 5120MB ~= 1.6M
+    // docs at 768d fp32). To build large (~50M-doc) IVF segments we must raise this; unset leaves the
+    // Lucene default. Set generously -- TMP treats segments above ~maxMergedSegmentMB/2 as merge-
+    // ineligible, so the value is roughly 2x the target segment size on disk.
+    final double maxMergedSegmentMB = Double.parseDouble(System.getProperty("knn.maxMergedSegmentMB", "-1"));
+    if (maxMergedSegmentMB > 0) {
+      ttmp.setMaxMergedSegmentMB(maxMergedSegmentMB);
+      System.out.println("TieredMergePolicy maxMergedSegmentMB=" + maxMergedSegmentMB);
+    }
     iwc.getCodec().compoundFormat().setShouldUseCompoundFile(false);
     // tmp.setSegmentsPerTier(5);
     if (useBp) {
@@ -139,6 +158,19 @@ public class KnnIndexer implements FormatterLogger {
 
     ConcurrentMergeScheduler cms = (ConcurrentMergeScheduler) iwc.getMergeScheduler();
     // cms.setMaxMergesAndThreads(24, 12);
+
+    // CMS concurrency, overridable, because the default interacts badly with a codec that is itself
+    // internally parallel. CMS defaults maxThreadCount to min(4, cores/2) on an SSD, so up to 4 merges
+    // run at once -- and an IVF codec like ivfaster fans each merge out over every core internally, so
+    // total build concurrency is the PRODUCT of the two. maxThreadCount=1 gives the other arrangement:
+    // one merge at a time, with all cores routing documents inside it.
+    //   -Dknn.cmsMaxThreadCount=N   (maxMergeCount defaults to N+5, as CMS itself does)
+    final int cmsThreads = Integer.getInteger("knn.cmsMaxThreadCount", -1);
+    if (cmsThreads > 0) {
+      final int cmsMerges = Integer.getInteger("knn.cmsMaxMergeCount", cmsThreads + 5);
+      cms.setMaxMergesAndThreads(cmsMerges, cmsThreads);
+      System.out.println("CMS maxMergeCount=" + cmsMerges + " maxThreadCount=" + cmsThreads);
+    }
 
     FieldType fieldType =
         switch (vectorEncoding) {
@@ -155,6 +187,26 @@ public class KnnIndexer implements FormatterLogger {
       System.out.println("creating index in " + indexPath);
     }
 
+    // Opt-in InfoStream that surfaces ONLY the ivfaster-evo codec's "IVFE" build messages (cold/hot
+    // start origin, carried assignments, seed cells, Lloyd iterations) without the full IndexWriter
+    // firehose. Enable with -Dknn.ivfInfoStream=true. Used to verify hot-start engagement.
+    if (Boolean.getBoolean("knn.ivfInfoStream")) {
+      iwc.setInfoStream(new InfoStream() {
+        @Override
+        public void message(String component, String message) {
+          System.out.println("[" + component + "] " + message);
+        }
+
+        @Override
+        public boolean isEnabled(String component) {
+          return "SIVF".equals(component);
+        }
+
+        @Override
+        public void close() {}
+      });
+    }
+
     if (indexPath.toFile().exists() == false) {
       indexPath.toFile().mkdirs();
     }
@@ -164,12 +216,16 @@ public class KnnIndexer implements FormatterLogger {
          IndexWriter iw = new IndexWriter(dir, iwc);
          FileChannel in = FileChannel.open(docsPath)) {
       long docsPathSizeInBytes = in.size();
-      if (docsPathSizeInBytes % (dim * vectorEncoding.byteSize) != 0) {
+      int recordBytes = halfFloatDocs ? dim * Short.BYTES : dim * vectorEncoding.byteSize;
+      if (docsPathSizeInBytes % recordBytes != 0) {
         throw new IllegalArgumentException("docsPath \"" + docsPath + "\" does not contain a whole number of vectors?  size=" + docsPathSizeInBytes);
       }
-      System.out.println((int) (docsPathSizeInBytes / (dim * vectorEncoding.byteSize)) + " doc vectors in docsPath \"" + docsPath + "\"");
-        
-      VectorReader vectorReader = VectorReader.create(in, dim, vectorEncoding, docsStartIndex);
+      System.out.println((int) (docsPathSizeInBytes / recordBytes) + " doc vectors in docsPath \"" + docsPath + "\""
+          + (halfFloatDocs ? " (fp16)" : ""));
+
+      VectorReader vectorReader = halfFloatDocs
+          ? VectorReader.createHalfFloat(in, dim, docsStartIndex)
+          : VectorReader.create(in, dim, vectorEncoding, docsStartIndex);
       log("parentJoin=%s\n", parentJoin);
       if (parentJoin == false) {
         ExecutorService exec = Executors.newFixedThreadPool(numIndexThreads);
