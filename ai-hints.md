@@ -31,6 +31,7 @@ Luceneutil is a comprehensive benchmarking suite for Apache Lucene. It includes 
    - **`shuffle_wiki_ids.py`**: Shuffles Cohere v3 Wikipedia embeddings while preserving wiki document boundaries
    - **`load_cohere_v3.py`**: Downloads and processes Cohere Wikipedia v3 vectors, partitions into queries/docs
    - **`load_dbpedia_openai3.py`**: Downloads Qdrant's 1M DBpedia OpenAI embeddings (3072d and 1536d), shuffles and partitions into queries/docs
+   - **`load_qdrant_supernova.py`**: Converts the dense vectors of Qdrant's Supernova datasets (FineWeb-10B, PubMed-MV, Coyo-VE) from Hugging Face parquet into .vec files, range-reading only the embedding column
    - **`shuffle_vec_file.py`**: Shuffles binary vector files using write-side random access for performance
    - All vector operations use sequential reads with random writes to optimize disk I/O
 
